@@ -1,1 +1,1 @@
-# Bitget-MiaCrypto-Copier
+# Crypto-Signal-Copier
