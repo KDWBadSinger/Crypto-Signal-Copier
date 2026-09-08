@@ -12,4 +12,18 @@ Build app UI in `src/`. Keep `.openai/hosting.json`, `worker/index.js`, `scripts
 
 - Use the bright, audit-first desktop console selected as Product Design option 2.
 - Keep the signal lifecycle visible: authorized message receipt, parsing, risk checks, and execution review.
-- Default all execution to Bitget demo trading and manual approval. Keep the global pause control prominent.
+- Keep Bitget demo trading and the local paper account visibly separate. The local paper account reads production Bitget market prices but never submits exchange orders.
+- Let users initialize the local paper account with virtual USDT principal and show equity, available balance, margin, fees, realized/unrealized P&L, and return.
+- Keep manual approval prominent for exchange demo execution; local paper auto-execution is an independent account setting.
+- Put the local paper account under a dedicated sidebar module named “实盘模拟”; do not attach it to the user avatar.
+- Do not show a separate “风控规则” sidebar module. Configure the paper follow strategy by selecting Telegram bloggers/channels inside “实盘模拟”.
+- Use “连接管理” as the single place to enter, validate, and review masked Bitget and Telegram API configuration; never expose saved secrets back to the frontend.
+- Use “资金管理” for the read-only Bitget UTA account view: equity, margin risk, assets, positions, and open orders. Keep it separate from the local “实盘模拟” ledger and omit identity, IP, and raw credential data.
+- Keep Bitget account data live with a read-only UTA private WebSocket feeding safe REST-calibrated snapshots to the browser; show connection/reconnect state and retain manual refresh as a fallback.
+- Treat “信号追踪” as an automatic execution monitor, not a manual approval workflow. Remove the receive/parse/risk/wait stepper and any per-signal approval CTA.
+- Show the currently tracked Telegram channel prominently in “信号追踪”. Let users choose market versus limit execution and size each automatic order by fixed USDT or by 0%–10% of account equity.
+- Preserve the original Telegram message view and make room for multi-message correlation: a blogger may post a market-entry message first, then send stop-loss and take-profit details in a later message for the same symbol.
+- Use the selected compact “自动订单监视器” direction for the signal screen: settings band, expandable signal list, merged-message detail, and automatic execution result.
+- Contract execution uses crossed margin. Let users set a default leverage in “信号追踪” and manage per-symbol leverage overrides in a dedicated sidebar module. Always cap the requested leverage at Bitget's live per-symbol maximum before an automatic order.
+- Treat fixed USDT and the 0%–10% account-equity option as margin actually committed by the user, not final position notional. Calculate order notional as committed margin multiplied by the effective leverage.
+- Communicate with the user in Chinese.

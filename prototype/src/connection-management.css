@@ -1,0 +1,44 @@
+.connections-page { min-height: 100vh; padding: 34px 38px 48px; background: #f7f9fc; }
+.connections-header { display: flex; align-items: flex-start; gap: 15px; max-width: 1160px; margin: 0 auto 24px; }
+.connections-title-icon { width: 42px; height: 42px; display: grid; place-items: center; border-radius: 10px; background: #e9f2ff; color: var(--blue); }
+.connections-title-icon svg { width: 22px; height: 22px; }
+.connections-header span { color: #7b8493; font-size: 11px; }
+.connections-header h1 { margin-top: 2px; font-size: 25px; }
+.connections-header p { margin-top: 7px; color: #697386; font-size: 12px; }
+.connection-message { max-width: 1160px; margin: 0 auto 16px; padding: 11px 13px; display: flex; align-items: center; gap: 8px; border-radius: 8px; font-size: 12px; }
+.connection-message.success { border: 1px solid #bce5cd; background: #edf9f2; color: #177b46; }
+.connection-message.error { border: 1px solid #f2c56b; background: #fff9ec; color: #8c5900; }
+.connections-grid { max-width: 1160px; margin: 0 auto; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 20px; align-items: start; }
+.connection-card { padding: 22px; border: 1px solid var(--border); border-radius: 11px; background: #fff; box-shadow: 0 5px 18px rgba(16,24,40,.035); }
+.connection-card-head { display: grid; grid-template-columns: 42px 1fr auto; gap: 12px; align-items: center; }
+.service-icon { width: 42px; height: 42px; display: grid; place-items: center; border-radius: 10px; }
+.service-icon svg { width: 22px; height: 22px; }
+.service-icon.bitget { color: #1769f6; background: #eaf2ff; }
+.service-icon.telegram { color: #229ed9; background: #e9f7fd; }
+.connection-card-head h2 { font-size: 16px; }
+.connection-card-head p { margin-top: 3px; color: #7b8493; font-size: 10px; }
+.connection-badge { padding: 5px 9px; display: inline-flex; align-items: center; gap: 5px; border-radius: 999px; font-size: 10px; font-weight: 600; }
+.connection-badge svg { width: 13px; height: 13px; }
+.connection-badge.connected { color: #168149; background: #eaf8ef; }
+.connection-badge.offline { color: #8a5a05; background: #fff5dd; }
+.connection-detail { min-height: 37px; margin: 16px 0; padding: 9px 11px; border-radius: 6px; background: #f7f9fc; color: #687386; font-size: 10px; line-height: 1.6; }
+.environment-picker { display: grid; grid-template-columns: 1fr 1fr; gap: 4px; margin-bottom: 16px; padding: 4px; border-radius: 8px; background: #f0f3f7; }
+.environment-picker button { height: 34px; border: 0; border-radius: 6px; background: transparent; color: #667085; font-size: 11px; }
+.environment-picker button.active { background: #fff; color: var(--blue); font-weight: 600; box-shadow: 0 1px 4px rgba(16,24,40,.1); }
+.connection-field { display: grid; gap: 6px; margin-top: 13px; color: #4f5a6b; font-size: 11px; font-weight: 500; }
+.connection-field > input, .secret-input input { width: 100%; height: 41px; padding: 0 11px; border: 1px solid #dce2ea; border-radius: 7px; background: #fff; color: #202631; outline: none; }
+.connection-field > input:focus, .secret-input input:focus { border-color: var(--blue); box-shadow: 0 0 0 3px #e8f1ff; }
+.connection-field small { color: #9098a6; font-size: 9px; font-weight: 400; }
+.secret-input { position: relative; }
+.secret-input input { padding-right: 42px; }
+.secret-input button { position: absolute; top: 3px; right: 4px; width: 35px; height: 35px; display: grid; place-items: center; border: 0; background: transparent; color: #7e8897; }
+.secret-input svg { width: 17px; height: 17px; }
+.security-note { margin-top: 17px; padding: 11px; display: flex; gap: 9px; border-radius: 7px; background: #f0f6ff; color: #4772b9; font-size: 9px; line-height: 1.5; }
+.security-note > svg { flex: 0 0 auto; width: 18px; height: 18px; }
+.security-note strong { display: block; margin-bottom: 2px; color: #315c9d; font-size: 10px; }
+.telegram-note { color: #43758d; background: #eef9fd; }
+.telegram-note strong { color: #28657f; }
+.save-connection { width: 100%; height: 43px; margin-top: 16px; border: 0; border-radius: 7px; background: var(--blue); color: #fff; font-size: 12px; font-weight: 600; }
+.save-connection:hover { background: #0f5ce1; }
+.save-connection:disabled { cursor: not-allowed; background: #aab4c4; }
+@media (max-width: 900px) { .connections-page { padding: 24px 18px; } .connections-grid { grid-template-columns: 1fr; } }

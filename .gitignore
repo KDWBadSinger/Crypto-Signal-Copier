@@ -1,0 +1,27 @@
+# Secrets and local sessions
+.env
+backend/.env
+*.session
+*.session-journal
+
+# Local data
+backend/data/
+*.sqlite3
+*.sqlite3-shm
+*.sqlite3-wal
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+backend/.venv/
+
+# Frontend
+prototype/node_modules/
+prototype/dist/
+*.log
+
+# OS/editor
+.DS_Store
+Thumbs.db

@@ -11,6 +11,13 @@ export default defineConfig({
   server: {
     host: "0.0.0.0",
     allowedHosts: ["terminal.local"],
+    proxy: {
+      "/api": {
+        target: process.env.MIA_API_TARGET || "http://127.0.0.1:8000",
+        changeOrigin: false,
+        ws: true,
+      },
+    },
     warmup: {
       clientFiles: ["./src/main.jsx"],
     },
