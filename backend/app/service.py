@@ -6,7 +6,7 @@ from dataclasses import replace
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 
-from .bitget import BitgetDemoClient, BitgetError
+from .bitget import BitgetDemoClient, BitgetError, BitgetOrderUncertain
 from .bitget_ws import BitgetPrivateStream
 from .config import Settings, update_env_file
 from .models import (
@@ -22,7 +22,10 @@ from .models import (
     ConnectionState,
     ExecutionMethod,
     LeverageOverrides,
+    MarketOverview,
+    MarketTicker,
     ParsedSignal,
+    PaperAccount,
     SignalStatus,
     SizingMode,
     SystemStatus,
@@ -32,6 +35,9 @@ from .parser import parse_signal
 from .paper import PaperTradingError, PaperTradingStore
 from .storage import SignalStore
 from .telegram_client import TelegramSignalClient
+from .market_feed import PublicMarketFeed
+from .licensing import LicenseClient
+from .account_curve import AccountCurve
 
 
 DEMO_SIGNAL = """ETHUSDT SHORT
@@ -46,10 +52,16 @@ class CopierService:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
         self.store = SignalStore(settings.database_path)
+        self.account_curve = AccountCurve(self.store)
+        self.license = LicenseClient(self.store)
         self.bitget = BitgetDemoClient(settings)
         self.paper = PaperTradingStore(settings.database_path)
-        self.telegram = TelegramSignalClient(settings, self.ingest_signal)
+        self._message_subscribers: set[asyncio.Queue] = set()
+        self.telegram = TelegramSignalClient(settings, self.ingest_signal, self.record_telegram_message, self.store.get_message, self.manage_telegram_position)
+        self._execution_lock = asyncio.Lock()
         self._paper_monitor_task: asyncio.Task | None = None
+        self._paper_lock = asyncio.Lock()
+        self.market_feed = PublicMarketFeed(self._on_market_tick, self._market_symbols, settings.bitget_product_type)
         self._account_reconcile_task: asyncio.Task | None = None
         self.bitget_connected = False
         self.bitget_detail = "未配置"
@@ -79,9 +91,12 @@ class CopierService:
         )
 
     async def start(self) -> None:
+        self.paper.runtime_start()
+        await self.market_feed.start()
         self.bitget_connected, self.bitget_detail = await self.bitget.healthcheck()
         if self.bitget_connected:
-            await self.bitget_stream.start()
+            if isinstance((await self.bitget.account_summary()).get("data"), dict):
+                await self.bitget_stream.start()
         if self.settings.seed_demo_data and self.store.latest() is None:
             await self.ingest_signal(
                 parse_signal(DEMO_SIGNAL, source_name="CryptoAlpha Premium")
@@ -93,6 +108,7 @@ class CopierService:
         await self.telegram.start()
 
     async def stop(self) -> None:
+        await self.market_feed.stop()
         if self._paper_monitor_task:
             self._paper_monitor_task.cancel()
             try:
@@ -106,17 +122,27 @@ class CopierService:
             except asyncio.CancelledError:
                 pass
         await self.telegram.stop()
+        self.paper.runtime_stop()
         await self.bitget_stream.stop()
         await self.bitget.close()
 
     async def ingest_signal(self, signal: ParsedSignal) -> None:
-        inserted = self.store.upsert(signal)
+        inserted = self.store.upsert(signal, update=False)
+        if inserted:
+            try:
+                await self.license.allow_new_order()
+            except ValueError as exc:
+                self.store.add_audit(signal.id, 'license_blocked', str(exc))
+                return
         if inserted and self.paper.is_initialized() and self.paper.should_auto_execute(signal.source_name):
             try:
                 await self.paper_execute(signal)
             except (PaperTradingError, BitgetError) as exc:
                 self.store.add_audit(signal.id, "paper_execution_failed", str(exc))
         if not inserted or self.manual_review_enabled:
+            return
+        if not self.settings.bitget_is_demo:
+            self.store.add_audit(signal.id, "auto_execution_blocked", "实盘仅支持只读连接")
             return
         if not self.settings.bitget_enable_demo_orders:
             self.store.add_audit(
@@ -156,9 +182,14 @@ class CopierService:
             )
         except (ValueError, BitgetError) as exc:
             self.store.add_audit(signal.id, "auto_execution_failed", str(exc))
+            latest = self.store.get(signal.id)
+            if latest.status not in {SignalStatus.UNKNOWN, SignalStatus.SUBMITTING}:
+                self.store.update_status(signal, SignalStatus.REJECTED, detail=str(exc))
 
     async def paper_execute(self, signal: ParsedSignal) -> None:
-        inserted = self.paper.enqueue(signal)
+        await self.license.allow_new_order()
+        async with self._paper_lock:
+            inserted = self.paper.enqueue(signal)
         if not inserted:
             raise PaperTradingError("该信号已经加入程序内模拟账户")
         self.store.add_audit(
@@ -168,17 +199,104 @@ class CopierService:
         )
         await self.refresh_paper_market([signal.symbol])
 
+    async def manage_telegram_position(self, message):
+        command = message['management']
+        try:
+            if command['ambiguous']:
+                raise PaperTradingError('管理消息含多个币种、否定或条件表述，不自动执行')
+            root_id = message.get('reply_to_message_id')
+            if message.get('reply_to_chat_id', message['chat_id']) != message['chat_id']:
+                raise PaperTradingError('跨频道回复不执行管理指令')
+            parent = self.store.get_message(message['chat_id'], root_id) if root_id else None
+            signal_id = parent.get('signal_id') if parent else None
+            if not command['symbol'] and not root_id:
+                raise PaperTradingError('缺少币种和直接回复关系，不能定位持仓')
+            async with self._paper_lock:
+                target = self.paper.management_target(message['chat_id'], command['symbol'],
+                                                       None if signal_id else root_id, signal_id)
+                price = await self.public_price(target['symbol'])
+                detail = self.paper.manage(message['chat_id'], message['message_id'], target['id'], command['actions'], price)
+            message.update(status='managed', signal_id=target['signal_id'], detail='程序内模拟：'+detail+'。未向 Bitget 交易所发送管理操作。')
+            self.store.add_audit(target['signal_id'], 'paper_management', message['detail'])
+        except (PaperTradingError, BitgetError, OSError) as exc:
+            message.update(status='management_rejected', detail=f'管理指令未执行：{exc}；交易所管理操作未启用')
+
     async def refresh_paper_market(self, symbols: list[str] | None = None) -> None:
-        active_symbols = symbols if symbols is not None else self.paper.active_symbols()
-        for symbol in active_symbols:
-            price = await self.bitget.market_price(symbol)
-            self.paper.mark(symbol, price)
+        async with self._paper_lock:
+            if not self.paper.is_initialized() or self.paper.snapshot().lifecycle == 'stopped':
+                return
+            try:
+                # Refresh the whole account before recording a coherent daily equity point.
+                active_symbols = self.paper.active_symbols()
+                prices = {symbol: await self.public_price(symbol) for symbol in active_symbols}
+                for symbol, price in prices.items():
+                    self.paper.mark(symbol, price)
+                self.paper.heartbeat(market_ok=True)
+            except (BitgetError, OSError, PaperTradingError) as exc:
+                self.paper.heartbeat(error="公开行情暂不可用，保留上次估值；恢复连接后继续")
+                raise
+
+    async def stop_paper(self) -> PaperAccount:
+        async with self._paper_lock:
+            account = self.paper.snapshot()
+            if account.lifecycle == 'stopped':
+                return account
+            symbols = {trade.symbol for trade in account.trades if trade.status == 'open'}
+            prices = {symbol: await self.public_price(symbol) for symbol in symbols}
+            return self.paper.settle(prices)
+
+    def _market_symbols(self):
+        return sorted(set(['BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'XRPUSDT']) | set(self.paper.active_symbols()))
+
+    async def public_price(self, symbol):
+        quote = self.market_feed.quote(symbol)
+        return quote['mark'] if quote else await self.bitget.market_price(symbol)
+
+    async def _on_market_tick(self, symbol, price):
+        if symbol not in self.paper.active_symbols():
+            return
+        async with self._paper_lock:
+            quote = self.market_feed.quote(symbol)
+            if quote:
+                self.paper.mark(symbol, quote['mark'])
+
+    async def market_overview(self) -> MarketOverview:
+        core_symbols = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT"]
+        tracked_symbols = set(self.paper.active_symbols())
+        if self.bitget_connected:
+            try:
+                account = await self.bitget_account_snapshot()
+                tracked_symbols.update(position.symbol for position in account.positions)
+                tracked_symbols.update(order.symbol for order in account.open_orders)
+            except BitgetError:
+                pass
+
+        symbols = core_symbols + sorted(tracked_symbols.difference(core_symbols))
+        snapshot = await self.bitget.market_snapshot(symbols)
+        items: list[MarketTicker] = []
+        for symbol in symbols:
+            ticker, closes = snapshot[symbol]
+            raw_price = ticker.get("lastPr") or ticker.get("markPrice")
+            if not raw_price:
+                continue
+            items.append(
+                MarketTicker(
+                    symbol=symbol,
+                    last_price=Decimal(str(raw_price)),
+                    change_24h=Decimal(str(ticker.get("change24h") or "0")),
+                    high_24h=Decimal(str(ticker.get("high24h") or "0")),
+                    low_24h=Decimal(str(ticker.get("low24h") or "0")),
+                    closes=closes,
+                    tracked=symbol in tracked_symbols,
+                )
+            )
+        return MarketOverview(items=items, updated_at=datetime.now(UTC))
 
     async def _paper_market_loop(self) -> None:
         while True:
             try:
                 await self.refresh_paper_market()
-            except (BitgetError, OSError) as exc:
+            except (BitgetError, OSError, PaperTradingError) as exc:
                 self.store.add_audit(None, "paper_market_refresh_failed", str(exc))
             await asyncio.sleep(5)
 
@@ -200,6 +318,7 @@ class CopierService:
             auto_order_size=self.settings.auto_demo_order_size,
             environment=self.settings.environment,
             bitget_environment=self.settings.bitget_api_environment,
+            telegram_selected_channels=self.selected_telegram_channels(),
         )
 
     @staticmethod
@@ -216,6 +335,7 @@ class CopierService:
             bitget=status.bitget,
             bitget_environment=self.settings.bitget_api_environment,
             bitget_api_key_hint=self._mask(self.settings.bitget_api_key),
+            demo_order_execution_enabled=self.settings.bitget_enable_demo_orders,
             telegram=status.telegram,
             telegram_api_id=self.settings.telegram_api_id,
             telegram_phone_hint=self._mask(self.settings.telegram_phone, visible=3),
@@ -238,6 +358,7 @@ class CopierService:
             bitget_api_secret=api_secret,
             bitget_api_passphrase=passphrase,
             bitget_api_environment=request.environment,
+            bitget_enable_demo_orders=request.environment == "demo" and request.enable_demo_orders,
         )
         new_client = BitgetDemoClient(candidate)
         connected, detail = await new_client.healthcheck()
@@ -245,12 +366,19 @@ class CopierService:
             await new_client.close()
             raise BitgetError(detail)
 
+        if candidate.bitget_enable_demo_orders:
+            account = await new_client.account_summary()
+            if isinstance(account.get("data"), dict):
+                await new_client.close()
+                raise BitgetError("本版本自动跟单使用经典合约模拟盘 V2；该 Key 属于 UTA 账户。请创建经典模拟盘 Key，或保持只读。")
+
         update_env_file(
             {
                 "BITGET_API_KEY": api_key,
                 "BITGET_API_SECRET": api_secret,
                 "BITGET_API_PASSPHRASE": passphrase,
                 "BITGET_API_ENVIRONMENT": request.environment,
+                "BITGET_ENABLE_DEMO_ORDERS": str(candidate.bitget_enable_demo_orders).lower(),
             }
         )
         old_client = self.bitget
@@ -264,7 +392,8 @@ class CopierService:
         self.bitget_connected = connected
         self.bitget_detail = detail
         await old_client.close()
-        await self.bitget_stream.start()
+        if isinstance((await self.bitget.account_summary()).get("data"), dict):
+            await self.bitget_stream.start()
         return await self.connection_overview()
 
     async def configure_telegram(
@@ -292,9 +421,70 @@ class CopierService:
         )
         await self.telegram.stop()
         self.settings = candidate
-        self.telegram = TelegramSignalClient(candidate, self.ingest_signal)
+        self.telegram = TelegramSignalClient(candidate, self.ingest_signal, self.record_telegram_message, self.store.get_message, self.manage_telegram_position)
         await self.telegram.start()
         return await self.connection_overview()
+
+    async def select_telegram_channels(self, chat_ids: list[int]) -> ConnectionOverview:
+        dialogs = await self.telegram_channels()
+        accessible = {item["id"] for item in dialogs}
+        if not set(chat_ids).issubset(accessible):
+            raise ValueError("只能选择当前 Telegram 账号已加入的频道或群组")
+        update_env_file({"TELEGRAM_ALLOWED_CHAT_IDS": ",".join(map(str, sorted(set(chat_ids))))})
+        self.settings = replace(self.settings, telegram_allowed_chat_ids=frozenset(chat_ids))
+        self.telegram.settings = self.settings
+        self.telegram.detail = f"已授权，监听 {len(set(chat_ids))} 个频道 / 群组"
+        self.notify_telegram_subscribers()
+        return await self.connection_overview()
+
+    async def telegram_channels(self) -> list[dict]:
+        channels = await self.telegram.dialogs()
+        self.store.set_setting("telegram_channel_names", json.dumps({str(c["id"]): c["title"] for c in channels}, ensure_ascii=False))
+        return channels
+
+    def selected_telegram_channels(self) -> list[dict]:
+        names = json.loads(self.store.get_setting("telegram_channel_names") or "{}")
+        return [{"id": chat_id, "title": self.telegram.channel_names.get(chat_id) or names.get(str(chat_id)) or str(chat_id)}
+                for chat_id in sorted(self.settings.telegram_allowed_chat_ids)]
+
+    def record_telegram_message(self, message: dict) -> None:
+        self.store.record_message(message)
+        self.notify_telegram_subscribers()
+
+    def notify_telegram_subscribers(self) -> None:
+        for queue in tuple(self._message_subscribers):
+            if not queue.full():
+                queue.put_nowait(True)
+
+    def telegram_inbox(self, chat_id: int | None = None, limit: int = 100) -> dict:
+        allowed = self.settings.telegram_allowed_chat_ids
+        channels = self.selected_telegram_channels()
+        connected, detail = self.telegram.state()
+        if chat_id is not None and chat_id not in allowed:
+            messages = []
+        else:
+            messages = [m for m in self.store.messages(1000 if chat_id is None else limit, chat_id)
+                        if m["chat_id"] in allowed][:limit]
+        for message in messages:
+            signal = self.store.get(message.get("signal_id", ""))
+            message["execution"] = signal.model_dump(mode="json") if signal else None
+            if signal:
+                message["audit"] = self.store.audit_for(signal.id)[-10:]
+                if signal.status == SignalStatus.PENDING_REVIEW:
+                    message["execution_note"] = ("自动跟单未启用" if self.manual_review_enabled else
+                        "请查看执行记录：模拟盘可能未连接或未允许下单")
+            elif message.get("origin") == "history":
+                message["execution_note"] = "历史补读，仅供查看，不触发跟单"
+            elif message.get("origin") == "edit":
+                message["execution_note"] = "编辑消息仅更新预览，不重新下单"
+            else:
+                message["execution_note"] = "未进入交易执行流程"
+        for channel in channels:
+            recent = self.store.messages(1, channel["id"])
+            channel["last_message_at"] = recent[0].get("sent_at") or recent[0]["received_at"] if recent else None
+        return {"channels": channels, "messages": messages, "connected": connected, "detail": detail,
+                "auto_execution_enabled": not self.manual_review_enabled,
+                "updated_at": datetime.now(UTC).isoformat()}
 
     @staticmethod
     def _decimal(value, default: str = "0") -> Decimal:
@@ -317,8 +507,13 @@ class CopierService:
         if not self.settings.bitget_configured or not self.bitget_connected:
             raise BitgetError("Bitget API 尚未连接")
         async with self._account_refresh_lock:
-            assets_result, settings_result, info_result, positions_result, orders_result = await asyncio.gather(
-                self.bitget.account_summary(),
+            assets_result = await self.bitget.account_summary()
+            if isinstance(assets_result.get("data"), list):
+                snapshot = await self._classic_account_snapshot(assets_result["data"])
+                self._account_snapshot_cache = snapshot
+                await self._publish_account_snapshot(snapshot)
+                return snapshot
+            settings_result, info_result, positions_result, orders_result = await asyncio.gather(
                 self.bitget.account_settings(),
                 self.bitget.account_info(),
                 self.bitget.current_positions(),
@@ -414,6 +609,37 @@ class CopierService:
         await self._publish_account_snapshot(snapshot)
         return snapshot
 
+    async def _classic_account_snapshot(self, accounts: list[dict]) -> BitgetAccountSnapshot:
+        positions, orders = await asyncio.gather(
+            self.bitget._request("GET", "/api/v2/mix/position/all-position", params={
+                "productType": self.settings.bitget_product_type, "marginCoin": self.settings.bitget_margin_coin}),
+            self.bitget._request("GET", "/api/v2/mix/order/orders-pending", params={
+                "productType": self.settings.bitget_product_type}),
+        )
+        assets = [BitgetAsset(coin=row.get("marginCoin", "USDT"),
+                             equity=self._decimal(row.get("accountEquity")),
+                             usd_value=self._decimal(row.get("usdtEquity") or row.get("accountEquity")),
+                             available=self._decimal(row.get("available"))) for row in accounts]
+        equity = sum((a.usd_value for a in assets), Decimal(0))
+        position_rows = positions.get("data") or []
+        order_rows = (orders.get("data") or {}).get("entrustedList") or []
+        return BitgetAccountSnapshot(
+            environment=self.settings.bitget_api_environment, account_mode="classic",
+            account_equity_usd=equity, account_equity_usdt=equity, assets=assets,
+            unrealised_pnl_usd=sum((self._decimal(row.get("unrealizedPL")) for row in position_rows), Decimal(0)),
+            positions=[BitgetPosition(symbol=row["symbol"], side=row.get("holdSide", ""),
+                margin_mode=row.get("marginMode", ""), margin_coin=row.get("marginCoin", "USDT"),
+                total=self._decimal(row.get("total")), leverage=self._decimal(row.get("leverage")),
+                average_price=self._decimal(row.get("openPriceAvg")), mark_price=self._decimal(row.get("markPrice")),
+                unrealised_pnl=self._decimal(row.get("unrealizedPL"))) for row in position_rows if row.get("symbol")],
+            open_orders=[BitgetOpenOrder(symbol=row["symbol"], category=self.settings.bitget_product_type,
+                side=row.get("side", ""), order_type=row.get("orderType", ""),
+                price=self._decimal(row.get("price")), quantity=self._decimal(row.get("size")),
+                filled_quantity=self._decimal(row.get("baseVolume")), status=row.get("status", ""),
+                created_at=self._timestamp(row.get("cTime"))) for row in order_rows if row.get("symbol")],
+            realtime_detail="经典模拟盘：REST 定时校准", updated_at=datetime.now(UTC),
+        )
+
     async def _on_bitget_stream_event(self, _: str) -> None:
         try:
             await self.refresh_bitget_account_snapshot()
@@ -445,6 +671,7 @@ class CopierService:
         await self._publish_account_snapshot(snapshot)
 
     async def _publish_account_snapshot(self, snapshot: BitgetAccountSnapshot) -> None:
+        self.account_curve.record(self.settings, snapshot)
         payload = snapshot.model_dump_json()
         for queue in tuple(self._account_subscribers):
             if queue.full():
@@ -538,6 +765,14 @@ class CopierService:
     async def approve(
         self, signal: ParsedSignal, request: ApproveSignalRequest
     ) -> ParsedSignal:
+        await self.license.allow_new_order()
+        async with self._execution_lock:
+            latest = self.store.get(signal.id) or signal
+            return await self._approve_locked(latest, request)
+
+    async def _approve_locked(
+        self, signal: ParsedSignal, request: ApproveSignalRequest
+    ) -> ParsedSignal:
         if signal.status not in {
             SignalStatus.PENDING_REVIEW,
             SignalStatus.APPROVED_DRY_RUN,
@@ -570,16 +805,28 @@ class CopierService:
 
         if not self.bitget_connected:
             raise BitgetError("Bitget demo account is not connected")
-        result = await self.bitget.place_signal_order(
-            validated_signal,
-            size=request.size,
-            entry_price=entry_price,
-            stop_loss=stop_loss,
-            take_profit=take_profit,
-            execution_method=request.execution_method,
-        )
+        if request.execution_method == ExecutionMethod.MARKET:
+            current_price = await self.bitget.market_price(signal.symbol)
+            if abs(current_price / entry_price - 1) > Decimal("0.02"):
+                raise ValueError("当前市价偏离信号参考入场价超过 2%，停止自动追单")
+            ParsedSignal.model_validate({**validated_signal.model_dump(), "entry_low": current_price,
+                                         "entry_high": current_price})
+        self.store.update_status(signal, SignalStatus.SUBMITTING, client_oid=f"mia_{signal.id}"[:32],
+                                 detail="正在提交模拟盘；中断时请通过 clientOid 核对，勿重复执行")
+        try:
+            result = await self.bitget.place_signal_order(
+                validated_signal, size=request.size, entry_price=entry_price,
+                stop_loss=stop_loss, take_profit=take_profit,
+                execution_method=request.execution_method,
+            )
+        except BitgetOrderUncertain as exc:
+            self.store.update_status(signal, SignalStatus.UNKNOWN, client_oid=f"mia_{signal.id}"[:32], detail=str(exc))
+            raise
+        except (ValueError, BitgetError) as exc:
+            self.store.update_status(signal, SignalStatus.REJECTED, detail=str(exc))
+            raise
         return self.store.update_status(
-            signal,
+            signal.model_copy(update={"execution_size": result.size or request.size}),
             SignalStatus.SUBMITTED,
             order_id=result.order_id,
             client_oid=result.client_oid,

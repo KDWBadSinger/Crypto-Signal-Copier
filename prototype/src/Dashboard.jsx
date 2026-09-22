@@ -1,6 +1,6 @@
 import { useState } from "react";
 import {
-  Bell, CaretDown, Coins, Database, FileText, Gauge, Gear, Link,
+  Bell, CaretDown, ChartLineUp, Coins, Database, FileText, Gauge, Gear, Link,
   ListChecks, TelegramLogo, Wallet,
 } from "@phosphor-icons/react";
 import "./dashboard.css";
@@ -9,22 +9,22 @@ import { PaperAccountView } from "./PaperAccount";
 import { ConnectionManagement } from "./ConnectionManagement";
 import { BitgetAccountView } from "./BitgetAccount";
 import { LeverageOverridesView } from "./LeverageOverrides";
+import { MarketOverview } from "./MarketOverview";
+import { TelegramInbox } from './TelegramInbox';
 
 const navItems = [
+  { id: "market", icon: ChartLineUp, label: "市场行情" },
   { id: "signals", icon: TelegramLogo, label: "信号追踪" },
+  { id: "telegram", icon: TelegramLogo, label: "Telegram 消息" },
   { id: "leverage", icon: Gauge, label: "币种杠杆" },
-  { id: "positions", icon: Database, label: "持仓管理" },
-  { id: "orders", icon: FileText, label: "历史订单" },
-  { id: "strategy", icon: Gear, label: "策略配置" },
   { id: "paper", icon: Wallet, label: "实盘模拟" },
   { id: "account", icon: Coins, label: "资金管理" },
   { id: "connections", icon: Link, label: "连接管理" },
-  { id: "notifications", icon: Bell, label: "通知设置" },
-  { id: "audit", icon: ListChecks, label: "日志审计" },
 ];
 
 export function Dashboard() {
-  const [activeNav, setActiveNav] = useState("signals");
+  const [activeNav, setActiveNav] = useState("market");
+  const [focusedSignal, setFocusedSignal] = useState(null);
   const activeItem = navItems.find((item) => item.id === activeNav) || navItems[0];
 
   return (
@@ -49,18 +49,20 @@ export function Dashboard() {
         </nav>
         <div className="account">
           <span className="avatar">U</span>
-          <span><strong>User123</strong><small>个人账户</small></span>
+          <span><strong>本机工作区</strong><small>桌面预览版 · 模拟盘</small></span>
           <CaretDown size={15} />
         </div>
       </aside>
 
       <main className="workspace">
-        {activeNav === "signals" ? <SignalTrackingView /> : null}
+        {activeNav === "market" ? <MarketOverview /> : null}
+        {activeNav === "signals" ? <SignalTrackingView focusSignalId={focusedSignal} /> : null}
+        {activeNav === "telegram" ? <TelegramInbox onManage={() => setActiveNav('connections')} onViewSignal={id => { setFocusedSignal(id); setActiveNav('signals'); }} /> : null}
         {activeNav === "leverage" ? <LeverageOverridesView /> : null}
         {activeNav === "paper" ? <PaperAccountView /> : null}
         {activeNav === "account" ? <BitgetAccountView /> : null}
         {activeNav === "connections" ? <ConnectionManagement /> : null}
-        {!new Set(["signals", "leverage", "paper", "account", "connections"]).has(activeNav) ? (
+        {!new Set(["market", "signals", "telegram", "leverage", "paper", "account", "connections"]).has(activeNav) ? (
           <div className="empty-module" aria-label={`${activeItem.label}页面`} />
         ) : null}
       </main>

@@ -8,8 +8,14 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-ENV_PATH = Path(__file__).resolve().parents[1] / ".env"
-load_dotenv(ENV_PATH)
+DATA_HOME = Path(os.environ["COPIER_DATA_DIR"]) if os.getenv("COPIER_DATA_DIR") else None
+ENV_PATH = (DATA_HOME or Path(__file__).resolve().parents[1]) / ".env"
+if DATA_HOME:
+    from .secrets import read_secrets
+    for _key, _value in read_secrets(DATA_HOME / "credentials.bin").items():
+        os.environ[_key] = _value
+else:
+    load_dotenv(ENV_PATH)
 
 
 def update_env_file(updates: dict[str, str]) -> None:
@@ -17,6 +23,11 @@ def update_env_file(updates: dict[str, str]) -> None:
     for key, value in updates.items():
         if "\n" in value or "\r" in value:
             raise ValueError(f"{key} cannot contain a newline")
+
+    if DATA_HOME:
+        from .secrets import write_secrets
+        write_secrets(DATA_HOME / "credentials.bin", updates)
+        return
 
     lines = ENV_PATH.read_text(encoding="utf-8").splitlines() if ENV_PATH.exists() else []
     remaining = dict(updates)
@@ -85,7 +96,6 @@ class Settings:
         return bool(
             self.telegram_api_id
             and self.telegram_api_hash
-            and self.telegram_allowed_chat_ids
         )
 
     @property
@@ -110,12 +120,12 @@ def load_settings() -> Settings:
         environment=os.getenv("APP_ENV", "development"),
         host=os.getenv("APP_HOST", "127.0.0.1"),
         port=int(os.getenv("APP_PORT", "8000")),
-        database_path=Path(os.getenv("APP_DATABASE_PATH", "./data/mia_copier.sqlite3")),
-        seed_demo_data=_bool_env("APP_SEED_DEMO_DATA", True),
+        database_path=Path(os.getenv("APP_DATABASE_PATH", str((DATA_HOME or Path(__file__).resolve().parents[1] / "data") / "mia_copier.sqlite3"))),
+        seed_demo_data=_bool_env("APP_SEED_DEMO_DATA", False),
         telegram_api_id=int(api_id_raw) if api_id_raw else None,
         telegram_api_hash=os.getenv("TELEGRAM_API_HASH") or None,
         telegram_phone=os.getenv("TELEGRAM_PHONE") or None,
-        telegram_session_path=Path(os.getenv("TELEGRAM_SESSION_PATH", "./data/telegram")),
+        telegram_session_path=Path(os.getenv("TELEGRAM_SESSION_PATH", str((DATA_HOME or Path(__file__).resolve().parents[1] / "data") / "telegram"))),
         telegram_allowed_chat_ids=_int_set_env("TELEGRAM_ALLOWED_CHAT_IDS"),
         bitget_api_key=os.getenv("BITGET_API_KEY") or None,
         bitget_api_secret=os.getenv("BITGET_API_SECRET") or None,

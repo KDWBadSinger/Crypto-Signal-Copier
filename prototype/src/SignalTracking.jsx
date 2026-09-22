@@ -7,18 +7,13 @@ import {
   getAutoExecutionSettings,
   getLeverageOverrides,
   getSignals,
+  getSignal,
+  getSignalAudit,
   getSystemStatus,
   saveAutoExecutionSettings,
 } from "./api";
 import "./signal-tracking.css";
-
-const demoRows = [
-  { id: "demo-btc", time: "15:35:18", symbol: "BTCUSDT", side: "long", raw_text: "BTCUSDT 市价做多", status: "submitted", source_name: "CryptoAlpha Premium" },
-  { id: "demo-sol", time: "15:21:47", symbol: "SOLUSDT", side: "long", raw_text: "SOLUSDT 市价做多", status: "submitted", source_name: "CryptoAlpha Premium" },
-  { id: "demo-xrp", time: "15:05:33", symbol: "XRPUSDT", side: "short", raw_text: "XRPUSDT 市价做空", status: "submitted", source_name: "CryptoAlpha Premium" },
-  { id: "demo-bnb", time: "14:50:11", symbol: "BNBUSDT", side: "long", raw_text: "BNBUSDT 市价做多", status: "submitted", source_name: "CryptoAlpha Premium" },
-  { id: "demo-doge", time: "14:32:09", symbol: "DOGEUSDT", side: "long", raw_text: "DOGEUSDT 市价做多", status: "submitted", source_name: "CryptoAlpha Premium" },
-];
+import { AccountPerformance } from './AccountPerformance';
 
 const defaultSettings = {
   enabled: false,
@@ -52,85 +47,31 @@ function SettingChoice({ value, current, children, onSelect }) {
   );
 }
 
-function SignalDetail({ signal, settings, effectiveLeverage }) {
-  const stopLoss = signal.stop_loss || "3,785";
-  const takeProfits = signal.take_profits?.length ? signal.take_profits : ["3,560", "3,440"];
-  const entry = signal.reference_entry || signal.entry_low || "3,689.42";
-  const submitted = signal.status === "submitted";
-  const numeric = (value) => Number(String(value).replaceAll(",", ""));
-  const committedMargin = settings.sizing_mode === "fixed_usdt"
-    ? `${settings.fixed_usdt} USDT`
-    : `账户权益的 ${settings.position_percent}%`;
-  const fixedMargin = Number(settings.fixed_usdt);
-  const estimatedNotional = settings.sizing_mode === "fixed_usdt"
-    ? fixedMargin * effectiveLeverage
-    : null;
-  const estimatedQuantity = estimatedNotional
-    ? `${(estimatedNotional / numeric(entry)).toFixed(4)} ${signal.symbol.replace("USDT", "")}`
-    : "按投入保证金 × 杠杆计算";
-  const leverage = `${effectiveLeverage}x`;
+const statusLabel = { submitted: '已提交模拟盘', pending_review: '待执行', approved_dry_run: '试运行', rejected: '执行失败', ignored: '已忽略', submitting: '提交中 / 待核对', unknown: '结果待核对' };
 
-  return (
-    <div className="signal-detail" role="region" aria-label={`${signal.symbol}信号详情`}>
-      <section className="original-thread">
-        <h3>原始消息（来自 Telegram）</h3>
-        <div className="message-step">
-          <span className="message-number">1</span>
-          <time>{signal.time}</time>
-          <PaperPlaneTilt size={21} weight="fill" />
-          <div className="telegram-bubble">
-            <strong>{signal.symbol} 市价{signal.side === "long" ? "做多" : "做空"}</strong>
-            <small>消息 ID：{signal.source_message_id || "63242101"}</small>
-          </div>
-        </div>
-        <div className="thread-link"><span />已自动关联同一交易对的后续消息</div>
-        <div className="message-step">
-          <span className="message-number">2</span>
-          <time>15:41:06</time>
-          <PaperPlaneTilt size={21} weight="fill" />
-          <div className="telegram-bubble">
-            <strong>SL: {stopLoss} / TP1: {takeProfits[0]} / TP2: {takeProfits[1] || takeProfits[0]}</strong>
-            <small>消息 ID：63242107</small>
-          </div>
-        </div>
-      </section>
-
-      <section className="parsed-result">
-        <h3>解析结果（已合并）</h3>
-        <dl>
-          <div><dt>交易对</dt><dd>{signal.symbol}</dd></div>
-          <div><dt>方向</dt><dd className={signal.side === "long" ? "long" : "short"}>{signal.side === "long" ? "做多" : "做空"}</dd></div>
-          <div><dt>入场方式</dt><dd>{settings.execution_method === "market" ? "市价" : "挂单"}</dd></div>
-          <div><dt>止损 SL</dt><dd>{numeric(stopLoss).toLocaleString()} USDT</dd></div>
-          <div><dt>止盈 TP1</dt><dd>{numeric(takeProfits[0]).toLocaleString()} USDT</dd></div>
-          <div><dt>止盈 TP2</dt><dd>{numeric(takeProfits[1] || takeProfits[0]).toLocaleString()} USDT</dd></div>
-          <div><dt>信号类型</dt><dd>开仓</dd></div>
-          <div><dt>合并消息数</dt><dd>2 条</dd></div>
-          <div><dt>解析时间</dt><dd>15:41:06</dd></div>
-        </dl>
-      </section>
-
-      <section className="execution-result">
-        <h3>自动执行结果</h3>
-        <dl>
-          <div><dt>执行状态</dt><dd><span className={submitted ? "executed-tag" : "waiting-tag"}>{submitted ? "已执行" : "等待自动执行"}</span></dd></div>
-          <div><dt>订单类型</dt><dd>{settings.execution_method === "market" ? "市价单" : "限价单"}</dd></div>
-          <div><dt>方向</dt><dd className={signal.side === "long" ? "long" : "short"}>{signal.side === "long" ? "买入 / 做多" : "卖出 / 做空"}</dd></div>
-          <div><dt>参考价格</dt><dd>{numeric(entry).toLocaleString()} USDT</dd></div>
-          <div><dt>成交数量</dt><dd>{submitted ? estimatedQuantity : "—"}</dd></div>
-          <div><dt>投入保证金</dt><dd>{committedMargin}</dd></div>
-          <div><dt>名义仓位</dt><dd>{estimatedNotional ? `${estimatedNotional} USDT` : "按账户权益计算"}</dd></div>
-          <div><dt>目标杠杆</dt><dd>{leverage}</dd></div>
-          <div><dt>保证金模式</dt><dd>全仓</dd></div>
-          <div><dt>订单 ID</dt><dd className="order-id">{signal.bitget_order_id || "等待交易所返回"}</dd></div>
-          <div><dt>执行时间</dt><dd>{submitted ? signal.time : "—"}</dd></div>
-        </dl>
-      </section>
-    </div>
-  );
+function SignalDetail({ signal }) {
+  const [audit, setAudit] = useState([]);
+  useEffect(() => { let active = true; getSignalAudit(signal.id).then(data => { if (active) setAudit(data); }).catch(() => {}); return () => { active = false; }; }, [signal.id, signal.status]);
+  return <div className="signal-detail">
+    <section className="original-thread"><h3>Telegram 原始消息</h3><pre style={{ whiteSpace: 'pre-wrap', overflowWrap: 'anywhere', fontSize: 13 }}>{signal.raw_text}</pre><small>消息 ID：{signal.source_message_id || '本地测试'} · {signal.source_name}</small></section>
+    <section className="parsed-result"><h3>解析结果</h3><dl>
+      <div><dt>交易对</dt><dd>{signal.symbol}</dd></div>
+      <div><dt>方向</dt><dd>{signal.side === 'long' ? '做多' : '做空'}</dd></div>
+      <div><dt>入场区间</dt><dd>{signal.entry_low} — {signal.entry_high}</dd></div>
+      <div><dt>止损</dt><dd>{signal.stop_loss}</dd></div>
+      <div><dt>止盈</dt><dd>{signal.take_profits.join(' / ')}</dd></div>
+    </dl><small>模拟盘订单预设止损和第一个止盈目标。</small></section>
+    <section className="execution-result"><h3>执行记录</h3><dl>
+      <div><dt>状态</dt><dd>{statusLabel[signal.status] || signal.status}</dd></div>
+      <div><dt>提交数量</dt><dd>{signal.execution_size || '—'}</dd></div>
+      <div><dt>交易所订单 ID</dt><dd>{signal.bitget_order_id || '—'}</dd></div>
+    </dl><small>已提交不代表已成交；成交以交易所回执为准。</small>
+    {audit.map((item, index) => <p key={index} style={{ fontSize: 12, overflowWrap: 'anywhere' }}>{new Date(item.created_at).toLocaleTimeString()} · {item.detail}</p>)}</section>
+  </div>;
 }
 
-export function SignalTrackingView() {
+export function SignalTrackingView({ focusSignalId }) {
+  const [focusedSignal, setFocusedSignal] = useState(null);
   const [settings, setSettings] = useState(defaultSettings);
   const [signals, setSignals] = useState([]);
   const [leverageOverrides, setLeverageOverrides] = useState([]);
@@ -158,20 +99,41 @@ export function SignalTrackingView() {
       setSignals(nextSignals);
       setLeverageOverrides(nextOverrides.items);
       setSystemStatus(nextStatus);
-      setExpandedId(nextSignals[0]?.id || "demo-btc");
+      setExpandedId(focusSignalId || nextSignals[0]?.id || null);
     }).catch((error) => {
       if (error.name !== "AbortError") setFeedback(error.message);
     }).finally(() => setLoading(false));
     return () => controller.abort();
   }, []);
 
-  const rows = useMemo(() => {
-    const serverRows = signals.map(formatSignal);
-    const usedSymbols = new Set(serverRows.map((item) => item.symbol));
-    return [...serverRows, ...demoRows.filter((item) => !usedSymbols.has(item.symbol))].slice(0, 6);
-  }, [signals]);
+  useEffect(() => {
+    const controller = new AbortController();
+    let pending = false;
+    const refresh = async () => {
+      if (pending) return;
+      pending = true;
+      try { const [nextSignals, nextStatus] = await Promise.all([getSignals(50, controller.signal), getSystemStatus(controller.signal)]); setSignals(nextSignals); setSystemStatus(nextStatus); }
+      catch (error) { if (error.name !== 'AbortError') setFeedback(error.message); }
+      finally { pending = false; }
+    };
+    const timer = setInterval(refresh, 2000);
+    return () => { controller.abort(); clearInterval(timer); };
+  }, []);
 
-  const sourceName = rows[0]?.source_name || "CryptoAlpha Premium";
+  useEffect(() => {
+    if (!focusSignalId) return;
+    const controller = new AbortController();
+    getSignal(focusSignalId, controller.signal).then(signal => { setFocusedSignal(signal); setExpandedId(signal.id); })
+      .catch(error => { if (error.name !== 'AbortError') setFeedback(error.message); });
+    return () => controller.abort();
+  }, [focusSignalId]);
+
+  const rows = useMemo(() => {
+    const items = focusedSignal && !signals.some(item => item.id === focusedSignal.id) ? [focusedSignal, ...signals] : signals;
+    return items.map(formatSignal);
+  }, [signals, focusedSignal]);
+
+  const sourceName = systemStatus?.telegram_selected_channels?.map(channel => channel.title).join('、') || "尚未选择监听频道";
   const leverageBySymbol = useMemo(
     () => new Map(leverageOverrides.map((item) => [item.symbol, item.leverage])),
     [leverageOverrides],
@@ -180,8 +142,9 @@ export function SignalTrackingView() {
   const activeCount = rows.filter((item) => item.status === "submitted").length;
   const visibleRows = rows.filter((item) => {
     if (signalFilter === "executed") return item.status === "submitted";
-    if (signalFilter === "pending") return item.status !== "submitted";
-    if (signalFilter === "skipped" || signalFilter === "failed") return false;
+    if (signalFilter === "pending") return ["pending_review", "approved_dry_run"].includes(item.status);
+    if (signalFilter === "skipped") return item.status === "ignored";
+    if (signalFilter === "failed") return item.status === "rejected";
     return true;
   });
 
@@ -226,15 +189,16 @@ export function SignalTrackingView() {
               aria-pressed={settings.enabled}
               onClick={() => updateSetting("enabled", !settings.enabled)}
             >
-              <span />{settings.enabled ? "自动执行中" : "自动执行未启用"}
+              <span />{settings.enabled ? "自动执行已启用" : "自动执行未启用"}
             </button>
           </div>
-          <p>信号源：Telegram · <strong>{sourceName}</strong><i />更新时间：2026-08-06 15:41:28（Asia/Shanghai）</p>
+          <p>信号源：Telegram · <strong>{sourceName}</strong><i />每 2 秒刷新 · {systemStatus?.bitget_environment === "demo" ? "Bitget 模拟盘" : "实盘只读"}</p>
         </div>
         <button className="save-settings" type="button" onClick={saveSettings} disabled={saving}>
           <GearSix size={17} />{saving ? "保存中…" : "保存设置"}
         </button>
       </header>
+      <AccountPerformance />
 
       <section className="execution-settings" aria-label="自动交易设置">
         <div className="source-setting">
@@ -288,11 +252,12 @@ export function SignalTrackingView() {
         </div>
         <div className="toolbar-filters">
           <button type="button">全部交易对 <CaretDown /></button>
-          <button type="button"><CalendarBlank />2026-08-06</button>
+          <span>最近 50 条信号</span>
         </div>
       </div>
 
       {feedback ? <div className={feedback.includes("已保存") ? "monitor-feedback success" : "monitor-feedback"}>{feedback}</div> : null}
+      {settings.enabled && (!systemStatus?.demo_order_execution_enabled || !systemStatus?.bitget?.connected || !systemStatus?.telegram?.connected) ? <div className="monitor-feedback">尚未具备自动跟单条件：请在连接管理完成 Telegram 登录和频道选择、连接 Bitget 模拟盘，并允许提交模拟盘订单。</div> : null}
 
       <section className="signal-table" aria-label="自动信号列表" aria-busy={loading}>
         <div className="signal-row signal-head">
@@ -307,19 +272,19 @@ export function SignalTrackingView() {
                 <span className="time-cell">{expanded ? <CaretDown /> : <CaretRight />}{signal.time}</span>
                 <strong>{signal.symbol}</strong>
                 <span><b className={signal.side === "long" ? "direction-tag long" : "direction-tag short"}>{signal.side === "long" ? "做多" : "做空"}</b></span>
-                <span className="summary-cell">{signal.symbol === "ETHUSDT" ? "2 条消息（已合并）" : signal.raw_text?.split("\n")[0]}</span>
+                <span className="summary-cell">{signal.raw_text?.split("\n")[0]}</span>
                 <span className="parse-cell"><CheckCircle weight="fill" />解析成功</span>
-                <span><b className={submitted ? "executed-tag" : "waiting-tag"}>{submitted ? "已执行" : "待执行"}</b></span>
+                <span><b className={submitted ? "executed-tag" : "waiting-tag"}>{statusLabel[signal.status] || signal.status}</b></span>
                 <span>{settings.sizing_mode === "fixed_usdt" ? `${settings.fixed_usdt} USDT` : `${settings.position_percent}%`}</span>
                 <span>{leverageFor(signal.symbol)}x</span>
-                <span>{submitted ? signal.time.replace(/\d{2}$/, (value) => String(Number(value) + 1).padStart(2, "0")) : "—"}</span>
+                <span>{signal.execution_at ? new Date(signal.execution_at).toLocaleTimeString() : "—"}</span>
               </button>
               {expanded ? <SignalDetail signal={signal} settings={settings} effectiveLeverage={leverageFor(signal.symbol)} /> : null}
             </div>
           );
         })}
         {visibleRows.length === 0 ? <div className="signal-empty">当前筛选条件下没有信号</div> : null}
-        <footer className="table-footer"><span>共 {visibleRows.length} 条</span><div><button disabled><CaretLeft /></button><button className="active">1</button><button>2</button><button>3</button><button><CaretRight /></button><button>10 条/页 <CaretDown /></button></div></footer>
+        <footer className="table-footer"><span>当前显示 {visibleRows.length} 条真实记录</span></footer>
       </section>
     </div>
   );

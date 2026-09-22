@@ -5,8 +5,9 @@ import hashlib
 import hmac
 import json
 import time
+import asyncio
 from dataclasses import dataclass
-from decimal import Decimal
+from decimal import Decimal, ROUND_DOWN, ROUND_HALF_UP
 from urllib.parse import urlencode
 
 import httpx
@@ -17,6 +18,10 @@ from .models import ExecutionMethod, ParsedSignal, SignalSide
 
 class BitgetError(RuntimeError):
     pass
+
+
+class BitgetOrderUncertain(BitgetError):
+    """A write may have reached the exchange. Never blindly retry it."""
 
 
 def create_signature(
@@ -39,6 +44,7 @@ class BitgetOrderResult:
     order_id: str
     client_oid: str
     raw: dict
+    size: Decimal | None = None
 
 
 class BitgetDemoClient:
@@ -50,6 +56,8 @@ class BitgetDemoClient:
 
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
+        self._candle_cache: dict[str, tuple[float, list[Decimal]]] = {}
+        self._candle_limit = asyncio.Semaphore(3)
         self._http = httpx.AsyncClient(
             base_url=settings.bitget_base_url,
             timeout=httpx.Timeout(10.0),
@@ -99,6 +107,7 @@ class BitgetDemoClient:
         params: dict[str, str] | None = None,
         payload: dict | None = None,
     ) -> dict:
+        is_write = method.upper() != 'GET'
         query_string = urlencode(sorted((params or {}).items()))
         body = (
             json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
@@ -107,22 +116,22 @@ class BitgetDemoClient:
         )
         timestamp = str(int(time.time() * 1000))
         request_target = f"{path}?{query_string}" if query_string else path
-        response = await self._http.request(
-            method,
-            request_target,
-            content=body.encode() if body else None,
-            headers=self._headers(
-                timestamp=timestamp,
-                method=method,
-                path=path,
-                query_string=query_string,
-                body=body,
-            ),
-        )
+        try:
+            response = await self._http.request(
+                method, request_target, content=body.encode() if body else None,
+                headers=self._headers(timestamp=timestamp, method=method, path=path,
+                                      query_string=query_string, body=body),
+            )
+        except httpx.HTTPError as exc:
+            error = BitgetOrderUncertain if is_write else BitgetError
+            raise error("Bitget 网络请求失败；若为下单请求，请核对交易所订单，勿重复提交") from exc
         try:
             data = response.json()
         except ValueError as exc:
-            raise BitgetError(f"Bitget returned HTTP {response.status_code} without JSON") from exc
+            error = BitgetOrderUncertain if is_write else BitgetError
+            raise error(f"Bitget returned HTTP {response.status_code} without JSON") from exc
+        if is_write and (response.status_code >= 500 or data.get('code') in {'40010','40725','45001'}):
+            raise BitgetOrderUncertain("Bitget 服务异常，下单结果待核对")
         if response.status_code >= 400 or data.get("code") != "00000":
             raise BitgetError(
                 f"Bitget error {data.get('code', response.status_code)}: {data.get('msg', 'unknown error')}"
@@ -188,10 +197,91 @@ class BitgetDemoClient:
         raw_price = ticker.get("markPrice") or ticker.get("lastPr") if ticker else None
         if not raw_price:
             raise BitgetError(f"Bitget returned no market price for {symbol}")
-        return Decimal(str(raw_price))
+        try:
+            price = Decimal(str(raw_price))
+            if not price.is_finite() or price <= 0:
+                raise ValueError('invalid price')
+            timestamp = ticker.get('ts')
+            if timestamp and not -5000 <= time.time()*1000-int(timestamp) <= 15000:
+                raise ValueError('stale price')
+            return price
+        except (ValueError, ArithmeticError) as exc:
+            raise BitgetError(f"无效或过期行情：{symbol}，拒绝按旧价执行") from exc
+
+    async def market_tickers(self) -> dict[str, dict]:
+        """Read all public USDT futures tickers with one unauthenticated request."""
+        try:
+            response = await self._http.get(
+                "/api/v2/mix/market/tickers",
+                params={"productType": self.settings.bitget_product_type},
+            )
+            data = response.json()
+        except (ValueError, httpx.HTTPError) as exc:
+            raise BitgetError("Failed to read Bitget market tickers") from exc
+        if response.status_code >= 400 or data.get("code") != "00000":
+            raise BitgetError(
+                f"Bitget market error {data.get('code', response.status_code)}: "
+                f"{data.get('msg', 'unknown error')}"
+            )
+        return {
+            str(item.get("symbol") or "").upper(): item
+            for item in (data.get("data") or [])
+            if item.get("symbol")
+        }
+
+    async def market_candles(self, symbol: str, limit: int = 24) -> list[Decimal]:
+        """Read recent 15-minute public candles, ordered from oldest to newest."""
+        try:
+            response = await self._http.get(
+                "/api/v2/mix/market/candles",
+                params={
+                    "symbol": symbol.upper(),
+                    "productType": self.settings.bitget_product_type,
+                    "granularity": "15m",
+                    "limit": str(limit),
+                },
+            )
+            data = response.json()
+        except (ValueError, httpx.HTTPError) as exc:
+            raise BitgetError(f"Failed to read Bitget candles for {symbol}") from exc
+        if response.status_code >= 400 or data.get("code") != "00000":
+            raise BitgetError(
+                f"Bitget market error {data.get('code', response.status_code)}: "
+                f"{data.get('msg', 'unknown error')}"
+            )
+        rows = data.get("data") or []
+        rows = sorted(rows, key=lambda row: int(row[0]))
+        return [Decimal(str(row[4])) for row in rows if len(row) > 4]
+
+    async def market_snapshot(self, symbols: list[str]) -> dict[str, tuple[dict, list[Decimal]]]:
+        tickers = await self.market_tickers()
+        async def cached_candles(symbol):
+            cached = self._candle_cache.get(symbol)
+            if cached and time.monotonic() - cached[0] < 60:
+                return cached[1]
+            async with self._candle_limit:
+                result = await self.market_candles(symbol)
+                self._candle_cache[symbol] = (time.monotonic(), result)
+                await asyncio.sleep(0.2)
+                return result
+        candles = await asyncio.gather(
+            *(cached_candles(symbol) for symbol in symbols),
+            return_exceptions=True,
+        )
+        return {
+            symbol: (
+                tickers.get(symbol, {}),
+                [] if isinstance(series, Exception) else series,
+            )
+            for symbol, series in zip(symbols, candles, strict=True)
+        }
 
     async def symbol_leverage_limits(self, symbol: str) -> tuple[int, int]:
         """Return Bitget's current public leverage range for a futures symbol."""
+        contract = await self.contract_config(symbol)
+        return int(contract.get("minLever") or 1), int(contract["maxLever"])
+
+    async def contract_config(self, symbol: str) -> dict:
         try:
             response = await self._http.get(
                 "/api/v2/mix/market/contracts",
@@ -212,11 +302,17 @@ class BitgetDemoClient:
         contract = contracts[0] if isinstance(contracts, list) and contracts else contracts
         if not contract or not contract.get("maxLever"):
             raise BitgetError(f"Bitget returned no leverage limits for {symbol}")
-        return int(contract.get("minLever") or 1), int(contract["maxLever"])
+        return contract
 
     async def set_cross_leverage(self, symbol: str, leverage: int) -> None:
+        if not self.settings.bitget_is_demo or not self.settings.bitget_enable_demo_orders:
+            raise BitgetError("仅允许在已启用的模拟盘调整杠杆")
         if self.settings.bitget_margin_mode != "crossed":
             raise BitgetError("Automatic execution requires crossed margin mode")
+        await self._request("POST", "/api/v2/mix/account/set-margin-mode", payload={
+            "symbol": symbol.upper(), "productType": self.settings.bitget_product_type,
+            "marginCoin": self.settings.bitget_margin_coin, "marginMode": "crossed",
+        })
         await self._request(
             "POST",
             "/api/v2/mix/account/set-leverage",
@@ -269,6 +365,22 @@ class BitgetDemoClient:
             )
         if not self.settings.bitget_enable_demo_orders:
             raise BitgetError("Demo order execution is disabled by configuration")
+        contract = await self.contract_config(signal.symbol)
+        step = Decimal(str(contract.get("sizeMultiplier") or "0"))
+        if step <= 0:
+            raise BitgetError("交易所未返回有效数量步长，停止下单")
+        size = (size / step).to_integral_value(rounding=ROUND_DOWN) * step
+        tick = Decimal(str(contract.get("priceEndStep") or "1")) * Decimal(10) ** -int(contract.get("pricePlace") or 0)
+        def price(value):
+            return (value / tick).to_integral_value(rounding=ROUND_HALF_UP) * tick
+        entry_price, stop_loss, take_profit = map(price, (entry_price, stop_loss, take_profit))
+        if size <= 0 or size < Decimal(str(contract.get("minTradeNum") or 0)):
+            raise BitgetError("投入金额低于该合约最小下单数量")
+        if size * entry_price < Decimal(str(contract.get("minTradeUSDT") or 0)):
+            raise BitgetError("投入金额低于该合约最小名义金额")
+        ParsedSignal.model_validate({**signal.model_dump(), "entry_low": entry_price,
+                                     "entry_high": entry_price, "stop_loss": stop_loss,
+                                     "take_profits": [take_profit]})
         client_oid = f"mia_{signal.id}"[:32]
         payload = {
             "symbol": signal.symbol,
@@ -286,12 +398,22 @@ class BitgetDemoClient:
         if execution_method == ExecutionMethod.LIMIT:
             payload["price"] = format(entry_price, "f")
             payload["force"] = "gtc"
-        result = await self._request(
-            "POST", "/api/v2/mix/order/place-order", payload=payload
-        )
+        try:
+            result = await self._request("POST", "/api/v2/mix/order/place-order", payload=payload)
+        except BitgetOrderUncertain as exc:
+            try:
+                result = await self._request("GET", "/api/v2/mix/order/detail", params={
+                    "symbol": signal.symbol, "productType": self.settings.bitget_product_type,
+                    "clientOid": client_oid,
+                })
+            except BitgetError:
+                raise exc
         data = result["data"]
+        if not data or not data.get("orderId"):
+            raise BitgetOrderUncertain("交易所未返回订单 ID，请在模拟盘核对 clientOid=" + client_oid)
         return BitgetOrderResult(
             order_id=str(data["orderId"]),
             client_oid=str(data.get("clientOid") or client_oid),
             raw=result,
+            size=size,
         )

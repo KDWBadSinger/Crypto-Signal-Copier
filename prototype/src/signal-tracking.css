@@ -118,3 +118,9 @@ dd.long { color: #15904d; }
   .signal-tabs { max-width: 100%; overflow-x: auto; }
   .toolbar-filters { display: none; }
 }
+.account-performance { margin: 16px 0; padding: 20px; border: 1px solid #dbe3ef; border-radius: 12px; background: white; }
+.account-performance h2 { font-size: 17px; margin: 0 0 12px; }
+.account-performance p, .account-performance small { font-size: 12px; color: #64748b; line-height: 1.8; }
+.account-performance select { padding: 8px; border: 1px solid #dbe3ef; border-radius: 6px; background: white; color: #334155; }
+.account-performance svg { display: block; width: 100%; max-height: 240px; }
+.account-curve-empty { padding: 28px; text-align: center; background: #f8fafc; border-radius: 8px; color: #64748b; font-size: 13px; }
