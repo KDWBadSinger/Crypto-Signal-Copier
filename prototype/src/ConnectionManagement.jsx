@@ -7,6 +7,9 @@ import {
   getConnections, getSystemStatus, saveBitgetConnection, saveTelegramConnection,
 } from "./api";
 import "./connection-management.css";
+import { TelegramSetup } from './TelegramSetup';
+import { SystemPanel } from './SystemPanel';
+import { UtaReadiness } from './UtaReadiness';
 
 function SecretInput({ label, value, onChange, placeholder, help }) {
   const [visible, setVisible] = useState(false);
@@ -40,14 +43,14 @@ export function ConnectionManagement({ onStatusChange }) {
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState("");
   const [message, setMessage] = useState(null);
-  const [bitget, setBitget] = useState({ api_key: "", api_secret: "", passphrase: "", environment: "live" });
+  const [bitget, setBitget] = useState({ api_key: "", api_secret: "", passphrase: "", environment: "demo", enable_demo_orders: false });
   const [telegram, setTelegram] = useState({ api_id: "", api_hash: "", phone: "", allowed_chat_ids: "" });
 
   useEffect(() => {
     const controller = new AbortController();
     getConnections(controller.signal).then((data) => {
       setOverview(data);
-      setBitget((current) => ({ ...current, environment: data.bitget_environment || "live" }));
+      setBitget((current) => ({ ...current, environment: data.bitget_environment || "demo", enable_demo_orders: data.demo_order_execution_enabled }));
       setTelegram((current) => ({
         ...current,
         api_id: data.telegram_api_id ? String(data.telegram_api_id) : "",
@@ -71,7 +74,7 @@ export function ConnectionManagement({ onStatusChange }) {
     setSaving("bitget");
     setMessage(null);
     try {
-      const payload = { environment: bitget.environment };
+      const payload = { environment: bitget.environment, enable_demo_orders: bitget.enable_demo_orders };
       if (bitget.api_key) payload.api_key = bitget.api_key;
       if (bitget.api_secret) payload.api_secret = bitget.api_secret;
       if (bitget.passphrase) payload.passphrase = bitget.passphrase;
@@ -136,6 +139,7 @@ export function ConnectionManagement({ onStatusChange }) {
         <SecretInput label="Secret Key" value={bitget.api_secret} onChange={(value) => setBitget({ ...bitget, api_secret: value })} placeholder={overview?.bitget?.configured ? "已安全保存，留空不修改" : "输入 Secret Key"} />
         <SecretInput label="Passphrase" value={bitget.passphrase} onChange={(value) => setBitget({ ...bitget, passphrase: value })} placeholder={overview?.bitget?.configured ? "已安全保存，留空不修改" : "输入 Passphrase"} />
         <div className="security-note"><ShieldCheck weight="fill" /><span><strong>实盘安全保护</strong>实盘模式仅允许读取，程序会在网络请求前阻止真实下单。</span></div>
+        {bitget.environment === 'demo' && <label className="demo-order-switch"><input type="checkbox" checked={bitget.enable_demo_orders} onChange={event => setBitget({ ...bitget, enable_demo_orders: event.target.checked })} />允许向 Bitget 模拟盘提交订单（另需在信号追踪开启自动执行）</label>}
         <button className="save-connection" disabled={saving === "bitget"}>{saving === "bitget" ? "正在验证…" : "验证并保存 Bitget"}</button>
       </form>
 
@@ -149,10 +153,13 @@ export function ConnectionManagement({ onStatusChange }) {
         <label className="connection-field"><span>API ID</span><input type="number" min="1" required value={telegram.api_id} onChange={(event) => setTelegram({ ...telegram, api_id: event.target.value })} placeholder="例如 12345678" /></label>
         <SecretInput label="API Hash" value={telegram.api_hash} onChange={(value) => setTelegram({ ...telegram, api_hash: value })} placeholder={overview?.telegram_api_hash_configured ? "已安全保存，留空不修改" : "输入 API Hash"} />
         <label className="connection-field"><span>手机号</span><input value={telegram.phone} onChange={(event) => setTelegram({ ...telegram, phone: event.target.value })} placeholder={overview?.telegram_phone_hint || "+86…"} /><small>包含国家区号；留空保留当前手机号</small></label>
-        <label className="connection-field"><span>允许的频道 / 群组 ID</span><input required value={telegram.allowed_chat_ids} onChange={(event) => setTelegram({ ...telegram, allowed_chat_ids: event.target.value })} placeholder="-1001234567890, -1009876543210" /><small>多个数字 ID 使用英文逗号分隔</small></label>
+        <p>登录后可在下方勾选频道，无需手动输入频道 ID。</p>
         <div className="security-note telegram-note"><LockKey weight="fill" /><span><strong>首次登录</strong>保存 API 后，如未授权，系统会提示进行一次验证码登录并在本机生成 session。</span></div>
         <button className="save-connection" disabled={saving === "telegram"}>{saving === "telegram" ? "正在连接…" : "保存并连接 Telegram"}</button>
       </form>
     </div>
+    <TelegramSetup overview={overview} onOverview={data => { setOverview(data); setTelegram(current => ({ ...current, allowed_chat_ids: data.telegram_allowed_chat_ids.join(',') })); refreshAppStatus(); }} />
+    <SystemPanel />
+    <UtaReadiness />
   </div>;
 }

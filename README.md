@@ -1,5 +1,7 @@
 # Crypto-Signal-Copier
 
+Windows 桌面重构版已加入：双击 EXE、应用内 Telegram 验证码/两步验证登录、频道勾选、真实收信日志、Bitget 经典合约模拟盘自动跟单。使用与打包说明见 [桌面版说明](docs/DESKTOP.md)。以下旧版 Web 启动说明保留供开发使用；桌面版无需命令行 Telegram 登录，模拟盘执行开关可在连接管理中保存。
+
 一个默认安全、人工审核优先的 Telegram 信号解析与 Bitget 模拟盘执行工具。
 
 ## 当前能力

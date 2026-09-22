@@ -18,6 +18,8 @@ class SignalStatus(StrEnum):
     SUBMITTED = "submitted"
     IGNORED = "ignored"
     REJECTED = "rejected"
+    SUBMITTING = "submitting"
+    UNKNOWN = "unknown"
 
 
 class ExecutionMethod(StrEnum):
@@ -36,6 +38,7 @@ class ParsedSignal(BaseModel):
     source_name: str
     source_message_id: int | None = None
     raw_text: str
+    market_entry: bool = False
     symbol: str
     side: SignalSide
     entry_low: Decimal
@@ -48,6 +51,9 @@ class ParsedSignal(BaseModel):
     received_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
     bitget_order_id: str | None = None
     client_oid: str | None = None
+    execution_detail: str | None = None
+    execution_size: Decimal | None = None
+    execution_at: datetime | None = None
 
     @property
     def reference_entry(self) -> Decimal:
@@ -55,6 +61,8 @@ class ParsedSignal(BaseModel):
 
     @model_validator(mode="after")
     def validate_trade_geometry(self) -> "ParsedSignal":
+        if self.stop_loss <= 0 or any(tp <= 0 for tp in self.take_profits):
+            raise ValueError("stop loss and take profits must be positive")
         if self.entry_low <= 0 or self.entry_high <= 0:
             raise ValueError("entry prices must be positive")
         if self.entry_low > self.entry_high:
@@ -95,6 +103,7 @@ class SystemStatus(BaseModel):
     auto_order_size: Decimal
     environment: str
     bitget_environment: str
+    telegram_selected_channels: list[dict] = Field(default_factory=list)
 
 
 class AutoExecutionSettings(BaseModel):
@@ -146,11 +155,36 @@ class SymbolLeverageLimit(BaseModel):
     max_leverage: int
 
 
+class MarketTicker(BaseModel):
+    symbol: str
+    last_price: Decimal
+    change_24h: Decimal = Decimal("0")
+    high_24h: Decimal = Decimal("0")
+    low_24h: Decimal = Decimal("0")
+    closes: list[Decimal] = Field(default_factory=list)
+    tracked: bool = False
+
+
+class MarketOverview(BaseModel):
+    items: list[MarketTicker]
+    updated_at: datetime
+
+
 class BitgetConnectionRequest(BaseModel):
     api_key: SecretStr | None = None
     api_secret: SecretStr | None = None
     passphrase: SecretStr | None = None
     environment: str = Field(pattern="^(demo|live)$")
+    enable_demo_orders: bool = False
+
+
+class TelegramLoginRequest(BaseModel):
+    code: SecretStr | None = None
+    password: SecretStr | None = None
+
+
+class TelegramChannelsRequest(BaseModel):
+    chat_ids: list[int] = Field(max_length=100)
 
 
 class TelegramConnectionRequest(BaseModel):
@@ -164,6 +198,7 @@ class ConnectionOverview(BaseModel):
     bitget: ConnectionState
     bitget_environment: str
     bitget_api_key_hint: str | None = None
+    demo_order_execution_enabled: bool = False
     telegram: ConnectionState
     telegram_api_id: int | None = None
     telegram_phone_hint: str | None = None
@@ -248,7 +283,15 @@ class PaperTradeStatus(StrEnum):
     REJECTED = "rejected"
 
 
-class PaperAccountResetRequest(BaseModel):
+class PaperSizingRequest(BaseModel):
+    leverage: int = Field(default=10, ge=1, le=100)
+    sizing_mode: str = Field(default='risk', pattern=r'^(risk|fixed_usdt|position_percent)$')
+    fixed_usdt: Decimal = Field(default=Decimal('100'), gt=0)
+    position_percent: Decimal = Field(default=Decimal('5'), gt=0, le=10)
+
+
+class PaperAccountResetRequest(PaperSizingRequest):
+    simulation_id: str = Field(default="", max_length=64, pattern=r"^[\w\- .]*$")
     initial_balance: Decimal = Field(gt=0)
     leverage: int = Field(default=10, ge=1, le=100)
     fee_rate: Decimal = Field(default=Decimal("0.0006"), ge=0, le=Decimal("0.01"))
@@ -293,6 +336,17 @@ class PaperTrade(BaseModel):
 
 class PaperAccount(BaseModel):
     initialized: bool
+    sizing_mode: str = 'risk'
+    fixed_usdt: Decimal = Decimal('100')
+    position_percent: Decimal = Decimal('5')
+    simulation_id: str | None = None
+    lifecycle: str = "not_created"
+    started_at: datetime | None = None
+    stopped_at: datetime | None = None
+    active_seconds: float = 0
+    elapsed_seconds: float = 0
+    market_updated_at: datetime | None = None
+    market_error: str | None = None
     initial_balance: Decimal = Decimal("0")
     equity: Decimal = Decimal("0")
     available_balance: Decimal = Decimal("0")

@@ -5,13 +5,30 @@ async function apiRequest(path, options = {}) {
   });
   const payload = await response.json().catch(() => null);
   if (!response.ok) {
-    throw new Error(payload?.detail || `API request failed (${response.status})`);
+    const detail = payload?.detail;
+    const error = new Error(Array.isArray(detail) ? detail.map((item) => `${item.loc?.slice(1).join('.')}: ${item.msg}`).join('；') : detail || `API request failed (${response.status})`);
+    error.status = response.status;
+    throw error;
   }
   return payload;
 }
 
 export function getSystemStatus(signal) {
   return apiRequest("/api/status", { signal });
+}
+export const getAccountPerformance = signal => apiRequest('/api/account/performance', { signal });
+export const getUtaReadiness = () => apiRequest('/api/uta/readiness');
+
+export const sendTelegramCode = () => apiRequest('/api/telegram/send-code', { method: 'POST' });
+export const signInTelegram = (body) => apiRequest('/api/telegram/sign-in', { method: 'POST', body: JSON.stringify(body) });
+export const getTelegramChannels = () => apiRequest('/api/telegram/channels');
+export const saveTelegramChannels = (chat_ids) => apiRequest('/api/telegram/channels', { method: 'POST', body: JSON.stringify({ chat_ids }) });
+export const getTelegramMessages = (signal) => apiRequest('/api/telegram/messages', { signal });
+export const getTelegramInbox = (chatId, signal) => apiRequest(`/api/telegram/inbox${chatId ? `?chat_id=${chatId}` : ''}`, { signal });
+export const syncTelegramHistory = (chatId) => apiRequest(`/api/telegram/channels/${chatId}/history`, { method: 'POST' });
+
+export function getMarketOverview(signal) {
+  return apiRequest("/api/market/overview", { signal });
 }
 
 export function setManualReview(enabled) {
@@ -77,6 +94,8 @@ export function getSignals(limit = 20, signal) {
   return apiRequest(`/api/signals?limit=${limit}`, { signal });
 }
 
+export const getSignal = (id, signal) => apiRequest(`/api/signals/${encodeURIComponent(id)}`, { signal });
+
 export function getSignalAudit(signalId, signal) {
   return apiRequest(`/api/signals/${signalId}/audit`, { signal });
 }
@@ -98,17 +117,24 @@ export function getPaperAccount(refresh = true, signal) {
   return apiRequest(`/api/paper/account?refresh=${refresh}`, { signal });
 }
 
-export function resetPaperAccount(initialBalance, leverage = 10, feeRate = "0.0006", selectedSources = []) {
+export function resetPaperAccount(initialBalance, leverage = 10, feeRate = "0.0006", selectedSources = [], simulationId = "", sizing = {}) {
   return apiRequest("/api/paper/account/reset", {
     method: "POST",
     body: JSON.stringify({
       initial_balance: initialBalance,
+      simulation_id: simulationId,
       leverage,
       fee_rate: feeRate,
       selected_sources: selectedSources,
+      ...sizing,
     }),
   });
 }
+
+export const stopPaperAccount = () => apiRequest('/api/paper/account/stop', { method: 'POST' });
+export const savePaperSizing = values => apiRequest('/api/paper/account/sizing', { method: 'POST', body: JSON.stringify(values) });
+export const getPaperReport = (id = '', signal) => apiRequest(`/api/paper/report${id ? `?simulation_id=${encodeURIComponent(id)}` : ''}`, { signal });
+export const getPaperReports = signal => apiRequest('/api/paper/reports', { signal });
 
 export function setPaperAutoExecute(enabled) {
   return apiRequest("/api/paper/account/auto-execute", {

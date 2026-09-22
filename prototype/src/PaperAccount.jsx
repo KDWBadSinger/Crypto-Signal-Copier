@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
   ArrowsClockwise, ChartLineUp, CheckCircle, Clock, Coins, Play,
   ShieldCheck, TrendDown, TrendUp, UsersThree, Wallet, Warning,
@@ -11,7 +11,10 @@ import {
   resetPaperAccount,
   setPaperAutoExecute,
   setPaperStrategy,
+  stopPaperAccount,
+  savePaperSizing,
 } from "./api";
+import { PaperPerformance, duration } from './PaperPerformance';
 import "./paper-account.css";
 
 const statusLabels = {
@@ -65,20 +68,35 @@ export function PaperAccountView() {
   const [selectedSources, setSelectedSources] = useState([]);
   const [initialBalance, setInitialBalance] = useState("10000");
   const [leverage, setLeverage] = useState("10");
+  const [sizingMode, setSizingMode] = useState('risk');
+  const [fixedUsdt, setFixedUsdt] = useState('100');
+  const [positionPercent, setPositionPercent] = useState('5');
+  const sizingLoaded = useRef(false);
+  const sizing = { leverage: Number(leverage), sizing_mode: sizingMode, fixed_usdt: fixedUsdt, position_percent: positionPercent };
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
+  const [simulationId, setSimulationId] = useState('');
+  const [creating, setCreating] = useState(false);
+  const [confirmStop, setConfirmStop] = useState(false);
+  const creatingRef = useRef(creating);
+  creatingRef.current = creating;
 
   const load = useCallback(async (refresh, abortSignal) => {
     const [nextAccount, signal, sources] = await Promise.all([
       getPaperAccount(refresh, abortSignal),
-      getLatestSignal(abortSignal),
+      getLatestSignal(abortSignal).catch(err => { if (err.status === 404) return null; throw err; }),
       getPaperSources(abortSignal),
     ]);
     setAccount(nextAccount);
+    if (nextAccount.initialized && !sizingLoaded.current) {
+      setLeverage(String(nextAccount.leverage)); setSizingMode(nextAccount.sizing_mode);
+      setFixedUsdt(String(nextAccount.fixed_usdt)); setPositionPercent(String(nextAccount.position_percent));
+      sizingLoaded.current = true;
+    }
     setLatestSignal(signal);
     setSourceOptions(sources);
-    setSelectedSources(nextAccount.selected_sources || []);
+    if (nextAccount.initialized && !creatingRef.current) setSelectedSources(nextAccount.selected_sources || []);
     setError("");
   }, []);
 
@@ -101,11 +119,11 @@ export function PaperAccountView() {
   }, [load]);
 
   const initializeAccount = async () => {
-    if (account?.initialized && !window.confirm("重新设置本金会清空所有本地模拟订单和盈亏记录。确认继续？")) return;
     setSaving(true);
     setError("");
     try {
-      setAccount(await resetPaperAccount(initialBalance, Number(leverage), "0.0006", selectedSources));
+      setAccount(await resetPaperAccount(initialBalance, Number(leverage), "0.0006", selectedSources, simulationId, sizing));
+      setCreating(false);
     } catch (saveError) {
       setError(saveError.message);
     } finally {
@@ -118,7 +136,7 @@ export function PaperAccountView() {
       ? selectedSources.filter((item) => item !== source)
       : [...selectedSources, source].sort();
     setSelectedSources(nextSources);
-    if (!account?.initialized) return;
+    if (!account?.initialized || creating) return;
     setSaving(true);
     setError("");
     try {
@@ -134,7 +152,8 @@ export function PaperAccountView() {
   const toggleAutoExecute = async () => {
     setSaving(true);
     try {
-      setAccount(await setPaperAutoExecute(!account.auto_execute));
+      setAccount(await stopPaperAccount());
+      setConfirmStop(false);
     } catch (saveError) {
       setError(saveError.message);
     } finally {
@@ -166,7 +185,7 @@ export function PaperAccountView() {
           <h1>实盘行情模拟账户</h1>
           <p>读取 Bitget 真实合约标记价，本金、订单、持仓与盈亏全部保存在本程序内。</p>
         </div>
-        <button className="paper-refresh" disabled={loading} onClick={() => load(true)}>
+        <button className="paper-refresh" disabled={loading} onClick={() => load(true).catch(err => setError(err.message))}>
           <ArrowsClockwise size={18} className={loading ? "spin" : ""} />刷新行情
         </button>
       </header>
@@ -178,19 +197,34 @@ export function PaperAccountView() {
       </div>
 
       {error ? <div className="api-error paper-error"><Warning weight="fill" />{error}</div> : null}
+      {account?.market_error && <div className="api-error paper-error">{account.market_error}</div>}
+      {account?.initialized && <section className="paper-run-banner"><div><strong>{account.simulation_id}</strong><span>{account.lifecycle === 'stopped' ? '已停止 · 结算已保存' : '持续跟单 · 重启自动恢复'}</span><small>累计在线 {duration(account.active_seconds)} · 最近有效行情 {account.market_updated_at ? new Date(account.market_updated_at).toLocaleString('zh-CN') : '尚无记录'}</small></div>{account.lifecycle === 'stopped' ? <button onClick={() => { setCreating(!creating); setSimulationId(''); }}>{creating ? '返回结算' : '创建新的模拟 ID'}</button> : <button className="paper-stop" disabled={saving} onClick={() => setConfirmStop(true)}>{saving ? '处理中…' : '停止跟单并结算'}</button>}</section>}
+      {confirmStop && <section className="paper-stop-confirm" role="alertdialog" aria-label="确认停止模拟"><h2>停止并结算 {account?.simulation_id}？</h2><p>按最新公开行情平掉模拟持仓（计入手续费），取消未成交订单。该 ID 结算后不再继续，报告将保留。行情不可用时不强行结算，可恢复网络后重试。</p><button disabled={saving} onClick={toggleAutoExecute}>{saving ? '正在结算…' : '确认停止并结算'}</button><button disabled={saving} onClick={() => setConfirmStop(false)}>继续跟单</button></section>}
 
-      {!account?.initialized ? (
+      {account?.lifecycle === 'stopped' && <PaperPerformance revision={`${account.simulation_id}:${account.updated_at}`} />}
+      {(account?.lifecycle !== 'stopped' || creating) && <section className="paper-panel paper-sizing" aria-label="模拟开仓设置">
+        <h2>模拟开仓设置</h2>
+        <p>保证金是投入本金；持仓名义金额 = 保证金 × 杠杆。设置只影响保存后收到的新订单，已有挂单与持仓保持原参数。</p>
+        <div className="paper-sizing-fields">
+          <label>定仓方式<select value={sizingMode} onChange={e => setSizingMode(e.target.value)}><option value="fixed_usdt">每单固定保证金</option><option value="position_percent">账户权益百分比保证金</option><option value="risk">按信号风险与止损距离</option></select></label>
+          {sizingMode === 'fixed_usdt' && <label>每单保证金（USDT）<input type="number" min="0.01" step="0.01" value={fixedUsdt} onChange={e => setFixedUsdt(e.target.value)} /></label>}
+          {sizingMode === 'position_percent' && <label>每单权益比例（%，最多 10）<input type="number" min="0.01" max="10" step="0.1" value={positionPercent} onChange={e => setPositionPercent(e.target.value)} /></label>}
+          <label>新单模拟杠杆<input type="number" min="1" max="100" step="1" value={leverage} onChange={e => setLeverage(e.target.value)} /></label>
+          {account?.initialized && !creating && <button disabled={saving || loading} onClick={async () => { setSaving(true); setError(''); try { setAccount(await savePaperSizing(sizing)); } catch(e) { setError(e.message); } finally { setSaving(false); } }}>保存新单设置</button>}
+        </div>
+        <p>{sizingMode === 'risk' ? '数量 = 当前权益 × 信号风险比例 ÷ 止损距离；风险比例缺省为 1%，不是每单固定投入 1%。' : sizingMode === 'fixed_usdt' ? `按当前输入：每单保证金 ${fixedUsdt} USDT，名义持仓约 ${Number(fixedUsdt)*Number(leverage)} USDT；另扣开仓手续费。` : '以成交时权益计算保证金；余额不足则拒绝开仓，不擅自缩小订单。'}</p>
+        {account?.initialized && !creating && <small>当前生效：{account.sizing_mode === 'risk' ? '风险定仓' : account.sizing_mode === 'fixed_usdt' ? `${account.fixed_usdt} USDT 保证金/单` : `权益 ${account.position_percent}% 保证金/单`} · {account.leverage} 倍杠杆</small>}
+      </section>}
+      {!account?.initialized || creating ? (
         <section className="paper-setup">
           <div className="setup-visual"><Wallet size={42} weight="duotone" /></div>
           <div className="setup-copy">
             <span>第一步</span><h2>创建你的程序内模拟账户</h2>
-            <p>输入一笔虚拟 USDT 本金。系统会根据每条信号的风险比例和止损距离计算仓位。</p>
+            <p>输入虚拟本金，并在上方设置每单保证金和杠杆。下方选择需要跟随的频道。</p>
           </div>
+          <label>自定义模拟 ID<input maxLength={64} placeholder="例如 Mia-30天测试（留空自动生成）" value={simulationId} onChange={event => setSimulationId(event.target.value)} /></label>
           <label>初始本金（USDT）<input type="number" min="1" step="100" value={initialBalance} onChange={(event) => setInitialBalance(event.target.value)} /></label>
-          <label>模拟杠杆<select value={leverage} onChange={(event) => setLeverage(event.target.value)}>
-            {[1, 2, 3, 5, 10, 20].map((value) => <option value={value} key={value}>{value}x</option>)}
-          </select></label>
-          <button disabled={saving || Number(initialBalance) <= 0} onClick={initializeAccount}>{saving ? "正在创建…" : "创建模拟账户"}</button>
+          <button disabled={saving || loading || Number(initialBalance) <= 0} onClick={initializeAccount}>{saving ? "正在创建…" : "创建并持续跟单"}</button>
           <div className="setup-source-picker"><SourcePicker sources={sourceOptions} selectedSources={selectedSources} disabled={saving} onToggle={toggleSource} /></div>
         </section>
       ) : (
@@ -209,7 +243,7 @@ export function PaperAccountView() {
               </div>
               {latestSignal ? <>
                 <div className="signal-price-grid"><div><span>入场区间</span><strong>{money(latestSignal.entry_low)} – {money(latestSignal.entry_high)}</strong></div><div><span>止损</span><strong>{money(latestSignal.stop_loss)}</strong></div><div><span>风险</span><strong>{latestSignal.risk_percent || 1}%</strong></div></div>
-                <button className="paper-primary" disabled={saving || latestAlreadyAdded} onClick={executeLatest}>
+                <button className="paper-primary" disabled={saving || latestAlreadyAdded || account.lifecycle === 'stopped'} onClick={executeLatest}>
                   {latestAlreadyAdded ? <><CheckCircle weight="fill" />已加入模拟账户</> : <><Play weight="fill" />使用实盘行情模拟</>}
                 </button>
               </> : <p className="paper-empty-copy">监听到 Telegram 信号后会显示在这里。</p>}
@@ -217,10 +251,10 @@ export function PaperAccountView() {
 
             <article className="paper-panel paper-settings">
               <div className="paper-panel-title"><div><span>跟单策略</span><h2>博主与执行设置</h2></div><ShieldCheck size={25} /></div>
-              <SourcePicker sources={sourceOptions} selectedSources={selectedSources} disabled={saving} onToggle={toggleSource} />
-              <div className="setting-row"><div><strong>已选博主新信号自动模拟</strong><small>仅为上述博主的新消息创建本地挂单</small></div><button role="switch" aria-checked={account.auto_execute} className={account.auto_execute ? "switch on" : "switch"} disabled={saving} onClick={toggleAutoExecute}><span /></button></div>
+              <SourcePicker sources={sourceOptions} selectedSources={selectedSources} disabled={saving || account.lifecycle === 'stopped'} onToggle={toggleSource} />
+              <div className="setting-row"><div><strong>{account.lifecycle === 'stopped' ? '本次模拟已结算' : account.auto_execute ? '已选博主新信号持续自动模拟' : '旧账户自动模拟未启用'}</strong><small>关闭应用不结算；重开继续处理新信号。市价信号按当前价模拟，区间信号等待入场。</small></div>{!account.auto_execute && account.lifecycle !== 'stopped' && <button onClick={async () => { try { setAccount(await setPaperAutoExecute(true)); } catch (err) { setError(err.message); } }}>启用持续跟单</button>}</div>
               <div className="setting-values"><span>杠杆<strong>{account.leverage}x</strong></span><span>模拟手续费<strong>{money(Number(account.fee_rate) * 100, 3)}%</strong></span><span>已付手续费<strong>{money(account.fees_paid)}</strong></span></div>
-              <div className="reset-row"><input type="number" min="1" value={initialBalance} onChange={(event) => setInitialBalance(event.target.value)} /><button disabled={saving} onClick={initializeAccount}>重置本金</button></div>
+              <p className="performance-note">运行中不可重置本金或覆盖 ID。停止结算后，可创建新的独立模拟。</p>
             </article>
           </section>
 
@@ -242,6 +276,7 @@ export function PaperAccountView() {
           </section>
         </div>
       )}
+      {account?.initialized && account.lifecycle !== 'stopped' && <PaperPerformance revision={`${account.simulation_id}:${account.updated_at}`} />}
     </>
   );
 }

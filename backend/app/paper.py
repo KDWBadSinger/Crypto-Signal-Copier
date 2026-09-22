@@ -3,9 +3,10 @@ from __future__ import annotations
 import json
 import sqlite3
 import threading
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal, ROUND_DOWN
 from pathlib import Path
+from .database import ManagedConnection
 
 from .models import (
     PaperAccount,
@@ -31,10 +32,11 @@ class PaperTradingStore:
         self.path = path
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
+        self._runtime_tick = None
         self._initialize()
 
     def _connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(self.path)
+        connection = sqlite3.connect(self.path, timeout=15, factory=ManagedConnection)
         connection.row_factory = sqlite3.Row
         return connection
 
@@ -87,6 +89,36 @@ class PaperTradingStore:
                 connection.execute(
                     "ALTER TABLE paper_account ADD COLUMN selected_sources TEXT NOT NULL DEFAULT '[]'"
                 )
+            for name, declaration in {
+                "sizing_mode": "TEXT NOT NULL DEFAULT 'risk'", "fixed_usdt": "TEXT NOT NULL DEFAULT '100'",
+                "position_percent": "TEXT NOT NULL DEFAULT '5'",
+                "simulation_id": "TEXT", "lifecycle": "TEXT NOT NULL DEFAULT 'running'",
+                "started_at": "TEXT", "stopped_at": "TEXT", "active_seconds": "REAL NOT NULL DEFAULT 0",
+                "market_updated_at": "TEXT", "market_error": "TEXT",
+            }.items():
+                if name not in columns:
+                    connection.execute(f"ALTER TABLE paper_account ADD COLUMN {name} {declaration}")
+            connection.execute("UPDATE paper_account SET simulation_id=COALESCE(simulation_id, 'legacy-simulation'), started_at=COALESCE(started_at, updated_at)")
+            trade_columns = {r['name'] for r in connection.execute('PRAGMA table_info(paper_trades)')}
+            if 'market_entry' not in trade_columns:
+                connection.execute("ALTER TABLE paper_trades ADD COLUMN market_entry INTEGER NOT NULL DEFAULT 0")
+            for name, declaration in {'source_chat_id': 'INTEGER', 'source_message_id': 'INTEGER',
+                                      'management_flags': "TEXT NOT NULL DEFAULT '[]'",
+                                      'sizing_mode': "TEXT NOT NULL DEFAULT 'risk'",
+                                      'sizing_value': "TEXT NOT NULL DEFAULT '0'"}.items():
+                if name not in trade_columns:
+                    connection.execute(f'ALTER TABLE paper_trades ADD COLUMN {name} {declaration}')
+            connection.execute('CREATE TABLE IF NOT EXISTS paper_commands (simulation_id TEXT NOT NULL, chat_id INTEGER NOT NULL, message_id INTEGER NOT NULL, result TEXT NOT NULL, PRIMARY KEY(simulation_id, chat_id, message_id))')
+            if connection.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='signals'").fetchone():
+                legacy = connection.execute('SELECT t.id, s.payload FROM paper_trades t JOIN signals s ON s.id=t.signal_id WHERE t.source_chat_id IS NULL').fetchall()
+                for old in legacy:
+                    payload = json.loads(old['payload'])
+                    connection.execute('UPDATE paper_trades SET source_chat_id=?, source_message_id=? WHERE id=?',
+                                       (payload.get('source_chat_id'), payload.get('source_message_id'), old['id']))
+            connection.executescript("""
+                CREATE TABLE IF NOT EXISTS paper_daily (day TEXT PRIMARY KEY, payload TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS paper_reports (simulation_id TEXT PRIMARY KEY, payload TEXT NOT NULL);
+            """)
 
     def reset(
         self,
@@ -94,11 +126,19 @@ class PaperTradingStore:
         leverage: int,
         fee_rate: Decimal,
         selected_sources: list[str] | None = None,
+        simulation_id: str = "",
     ) -> None:
         now = datetime.now(UTC).isoformat()
         sources_json = json.dumps(sorted(set(selected_sources or [])), ensure_ascii=False)
         with self._lock, self._connect() as connection:
+            previous = self._snapshot(connection)
+            if previous.initialized and previous.lifecycle != "stopped":
+                raise PaperTradingError("请先停止并结算当前模拟，再创建新 ID；不会覆盖运行中的账本")
+            identifier = simulation_id.strip() or f"SIM-{datetime.now(UTC):%Y%m%d-%H%M%S-%f}"
+            if connection.execute("SELECT 1 FROM paper_reports WHERE simulation_id=?", (identifier,)).fetchone():
+                raise PaperTradingError("该模拟 ID 已存在，请使用新的 ID；历史结算不会覆盖")
             connection.execute("DELETE FROM paper_trades")
+            connection.execute("DELETE FROM paper_daily")
             connection.execute(
                 """
                 INSERT INTO paper_account
@@ -114,6 +154,93 @@ class PaperTradingStore:
                 """,
                 (str(initial_balance), leverage, str(fee_rate), sources_json, now),
             )
+            connection.execute("UPDATE paper_account SET simulation_id=?, lifecycle='running', started_at=?, stopped_at=NULL, active_seconds=0, market_updated_at=NULL, market_error=NULL WHERE id=1", (identifier, now))
+            self._record_day(connection, now)
+
+    def runtime_start(self) -> None:
+        self._runtime_tick = datetime.now(UTC)
+
+    def heartbeat(self, *, market_ok: bool = False, error: str | None = None) -> None:
+        now = datetime.now(UTC)
+        seconds = max(0, (now - self._runtime_tick).total_seconds()) if self._runtime_tick else 0
+        self._runtime_tick = now
+        with self._lock, self._connect() as connection:
+            account = self._snapshot(connection)
+            if not account.initialized or account.lifecycle != "running":
+                return
+            connection.execute("UPDATE paper_account SET active_seconds=active_seconds+?, updated_at=? WHERE id=1", (min(seconds, 30), now.isoformat()))
+            if market_ok:
+                connection.execute("UPDATE paper_account SET market_updated_at=?, market_error=NULL WHERE id=1", (now.isoformat(),))
+                self._record_day(connection, now.isoformat())
+            elif error:
+                connection.execute("UPDATE paper_account SET market_error=? WHERE id=1", (error,))
+
+    def runtime_stop(self) -> None:
+        self.heartbeat()
+        self._runtime_tick = None
+
+    def _record_day(self, connection, now: str) -> None:
+        account = self._snapshot(connection)
+        balance = account.initial_balance + account.realized_pnl - account.fees_paid
+        point = {"day": now[:10], "observed_at": now, "balance": str(balance),
+                 "equity": str(account.equity), "profit": str(account.equity-account.initial_balance)}
+        connection.execute("INSERT INTO paper_daily VALUES (?,?) ON CONFLICT(day) DO UPDATE SET payload=excluded.payload", (now[:10], json.dumps(point)))
+
+    def _report(self, connection) -> dict:
+        account = self._snapshot(connection)
+        daily = {r['day']: json.loads(r['payload']) for r in connection.execute('SELECT * FROM paper_daily ORDER BY day')}
+        points = []
+        if account.started_at:
+            day = account.started_at.date()
+            end = (account.stopped_at or datetime.now(UTC)).date()
+            previous = account.initial_balance
+            while day <= end:
+                point = daily.get(day.isoformat())
+                if point:
+                    point['daily_profit'] = str(Decimal(point['equity']) - previous) if previous is not None else None
+                    previous = Decimal(point['equity'])
+                else:
+                    previous = None
+                points.append(point or {"day": day.isoformat(), "equity": None, "balance": None, "profit": None, "daily_profit": None})
+                day += timedelta(days=1)
+        return {"account": account.model_dump(mode="json"), "daily": points, "timezone": "UTC"}
+
+    def report(self, simulation_id: str | None = None) -> dict:
+        with self._connect() as connection:
+            if simulation_id:
+                row = connection.execute('SELECT payload FROM paper_reports WHERE simulation_id=?', (simulation_id,)).fetchone()
+                if not row:
+                    raise PaperTradingError("找不到该模拟的结算记录")
+                return json.loads(row['payload'])
+            return self._report(connection)
+
+    def reports(self) -> list[dict]:
+        with self._connect() as connection:
+            return [json.loads(row['payload'])['account'] for row in connection.execute('SELECT payload FROM paper_reports ORDER BY rowid DESC')]
+
+    def settle(self, prices: dict[str, Decimal]) -> PaperAccount:
+        self.heartbeat()
+        now = datetime.now(UTC).isoformat()
+        with self._lock, self._connect() as connection:
+            account = self._snapshot(connection)
+            if not account.initialized:
+                raise PaperTradingError("请先创建模拟")
+            if account.lifecycle == "stopped":
+                return account
+            rows = connection.execute("SELECT * FROM paper_trades WHERE status IN ('pending','open')").fetchall()
+            for row in rows:
+                if row['status'] == 'open':
+                    price = prices.get(row['symbol'])
+                    if price is None or not price.is_finite() or price <= 0:
+                        raise PaperTradingError("缺少有效的最新公开行情，结算未完成，请重试")
+                    self._close_size(connection, row, price, Decimal(row['remaining_size']), 'simulation_stopped', now)
+                else:
+                    self._reject(connection, row['id'], '停止跟单，取消未成交订单', now)
+            connection.execute("UPDATE paper_account SET lifecycle='stopped', stopped_at=?, auto_execute=0, updated_at=?, market_updated_at=?, market_error=NULL WHERE id=1", (now, now, now))
+            self._record_day(connection, now)
+            report = self._report(connection)
+            connection.execute('INSERT INTO paper_reports VALUES (?,?)', (account.simulation_id, json.dumps(report)))
+            return self._snapshot(connection)
 
     def is_initialized(self) -> bool:
         with self._connect() as connection:
@@ -135,6 +262,8 @@ class PaperTradingStore:
 
     def set_auto_execute(self, enabled: bool) -> None:
         with self._lock, self._connect() as connection:
+            if self._snapshot(connection).lifecycle == 'stopped':
+                raise PaperTradingError("已结算的模拟不可重新启用，请创建新 ID")
             cursor = connection.execute(
                 "UPDATE paper_account SET auto_execute=?, updated_at=? WHERE id=1",
                 (int(enabled), datetime.now(UTC).isoformat()),
@@ -145,6 +274,8 @@ class PaperTradingStore:
     def set_strategy(self, selected_sources: list[str]) -> None:
         normalized = sorted({source.strip() for source in selected_sources if source.strip()})
         with self._lock, self._connect() as connection:
+            if self._snapshot(connection).lifecycle == 'stopped':
+                raise PaperTradingError("已结算的模拟不可修改")
             cursor = connection.execute(
                 "UPDATE paper_account SET selected_sources=?, updated_at=? WHERE id=1",
                 (json.dumps(normalized, ensure_ascii=False), datetime.now(UTC).isoformat()),
@@ -157,13 +288,15 @@ class PaperTradingStore:
             raise PaperTradingError("请先初始化程序内模拟账户")
         now = datetime.now(UTC).isoformat()
         with self._lock, self._connect() as connection:
+            if self._snapshot(connection).lifecycle == 'stopped':
+                raise PaperTradingError("当前模拟已停止，不能加入新信号")
             exists = connection.execute(
                 "SELECT 1 FROM paper_trades WHERE signal_id=?", (signal.id,)
             ).fetchone()
             if exists:
                 return False
             account = connection.execute(
-                "SELECT leverage FROM paper_account WHERE id=1"
+                "SELECT * FROM paper_account WHERE id=1"
             ).fetchone()
             connection.execute(
                 """
@@ -180,7 +313,77 @@ class PaperTradingStore:
                     int(account["leverage"]), str(signal.risk_percent or Decimal("1")), now, now,
                 ),
             )
+            connection.execute("UPDATE paper_trades SET market_entry=? WHERE signal_id=?", (int(signal.market_entry), signal.id))
+            connection.execute('UPDATE paper_trades SET source_chat_id=?, source_message_id=? WHERE signal_id=?',
+                               (signal.source_chat_id, signal.source_message_id, signal.id))
+            connection.execute('UPDATE paper_trades SET sizing_mode=?, sizing_value=? WHERE signal_id=?',
+                               (account['sizing_mode'], account['fixed_usdt'] if account['sizing_mode'] == 'fixed_usdt' else account['position_percent'], signal.id))
         return True
+
+    def management_target(self, chat_id, symbol=None, root_id=None, signal_id=None):
+        with self._connect() as connection:
+            rows = connection.execute("SELECT * FROM paper_trades WHERE source_chat_id=? AND status='open'", (chat_id,)).fetchall()
+            rows = [r for r in rows if (not symbol or r['symbol'] == symbol)
+                    and (root_id is None or r['source_message_id'] == root_id)
+                    and (signal_id is None or r['signal_id'] == signal_id)]
+            if len(rows) != 1:
+                raise PaperTradingError('未找到唯一的同频道持仓，不猜测管理对象（可能未开仓、已平仓或存在多单）')
+            return dict(rows[0])
+
+    def manage(self, chat_id, message_id, trade_id, actions, price):
+        """Atomic, restart-safe paper-only management; caller supplies a fresh price."""
+        if not price.is_finite() or price <= 0:
+            raise PaperTradingError('管理指令需要有效实时价格')
+        now = datetime.now(UTC).isoformat()
+        with self._lock, self._connect() as connection:
+            connection.execute('BEGIN IMMEDIATE')
+            account = connection.execute('SELECT * FROM paper_account WHERE id=1').fetchone()
+            if not account or account['lifecycle'] != 'running' or not account['auto_execute']:
+                raise PaperTradingError('模拟未运行或已暂停自动跟单')
+            prior = connection.execute('SELECT result FROM paper_commands WHERE simulation_id=? AND chat_id=? AND message_id=?',
+                                       (account['simulation_id'], chat_id, message_id)).fetchone()
+            if prior:
+                return '重复消息：' + prior['result']
+            row = connection.execute("SELECT * FROM paper_trades WHERE id=? AND source_chat_id=? AND status='open'", (trade_id, chat_id)).fetchone()
+            if not row:
+                raise PaperTradingError('目标持仓已关闭或频道不匹配')
+            flags = set(json.loads(row['management_flags']))
+            entry, fee = Decimal(row['entry_price']), Decimal(account['fee_rate'])
+            long = row['side'] == 'long'
+            stop = Decimal(row['stop_loss'])
+            if (long and price <= stop) or (not long and price >= stop):
+                raise PaperTradingError('当前价格已触发原止损，不覆盖止损规则')
+            details = []
+            # A combined TP1 + runner message reduces once to the agreed runner size.
+            if 'breakeven' in actions:
+                cost = entry * (1+fee)/(1-fee) if long else entry*(1-fee)/(1+fee)
+                if (long and price <= cost) or (not long and price >= cost):
+                    raise PaperTradingError('当前价格尚不满足含双边手续费的保本条件')
+                cost = max(cost, stop) if long else min(cost, stop)
+                connection.execute('UPDATE paper_trades SET stop_loss=?, updated_at=? WHERE id=?', (str(cost), now, trade_id))
+                details.append(f'含双边手续费成本损 {cost:.8f}（只收紧，不放宽）')
+            if 'runner' in actions and 'runner' not in flags:
+                target = entry*(1+Decimal(5)/row['leverage']) if long else entry*(1-Decimal(5)/row['leverage'])
+                if target <= 0:
+                    raise PaperTradingError('当前杠杆下空单 500% 保证金收益目标无法达到正价格，不执行减仓')
+                remaining = Decimal(row['remaining_size'])
+                keep = (remaining*Decimal('0.1')).quantize(MONEY, rounding=ROUND_DOWN)
+                if keep <= MONEY:
+                    raise PaperTradingError('尾仓数量过小，未执行减仓')
+                self._close_size(connection, row, price, remaining-keep, 'runner_reduction', now)
+                connection.execute('UPDATE paper_trades SET take_profits=?, next_take_profit=0 WHERE id=?', (json.dumps([str(target)]), trade_id))
+                flags.update(['runner', 'tp1'])
+                details.append(f'保留指令执行前剩余仓位的 10%；500% 保证金毛收益目标价 {target}；保留止损')
+            elif 'tp1' in actions and 'tp1' not in flags and row['next_take_profit'] == 0:
+                count = len(json.loads(row['take_profits']))
+                self._close_size(connection, row, price, Decimal(row['remaining_size'])/count, 'manual_tp1', now, next_take_profit=1)
+                flags.add('tp1')
+                details.append(f'按实时价格 {price} 执行第一档止盈（原始 {count} 档等分）')
+            connection.execute('UPDATE paper_trades SET management_flags=? WHERE id=?', (json.dumps(sorted(flags)), trade_id))
+            detail = '；'.join(details) or '该减仓阶段已完成，不重复执行'
+            connection.execute('INSERT INTO paper_commands VALUES (?, ?, ?, ?)', (account['simulation_id'], chat_id, message_id, detail))
+            self._record_day(connection, now)
+            return detail
 
     def active_symbols(self) -> list[str]:
         with self._connect() as connection:
@@ -189,16 +392,26 @@ class PaperTradingStore:
             ).fetchall()
         return [str(row["symbol"]) for row in rows]
 
+    def set_sizing(self, request):
+        with self._lock, self._connect() as connection:
+            account = self._snapshot(connection)
+            if not account.initialized or account.lifecycle != 'running':
+                raise PaperTradingError('请先创建运行中的模拟；已结算账户不能修改')
+            connection.execute('UPDATE paper_account SET leverage=?, sizing_mode=?, fixed_usdt=?, position_percent=? WHERE id=1',
+                               (request.leverage, request.sizing_mode, str(request.fixed_usdt), str(request.position_percent)))
+
     @staticmethod
     def _pnl(side: str, entry: Decimal, exit_price: Decimal, size: Decimal) -> Decimal:
         direction = Decimal("1") if side == SignalSide.LONG.value else Decimal("-1")
         return (exit_price - entry) * size * direction
 
     def mark(self, symbol: str, price: Decimal) -> None:
+        if not price.is_finite() or price <= 0:
+            raise PaperTradingError("公开行情价格无效")
         now = datetime.now(UTC).isoformat()
         with self._lock, self._connect() as connection:
             account = connection.execute("SELECT * FROM paper_account WHERE id=1").fetchone()
-            if not account:
+            if not account or account['lifecycle'] == 'stopped':
                 return
             rows = connection.execute(
                 "SELECT * FROM paper_trades WHERE symbol=? AND status IN ('pending','open')",
@@ -216,7 +429,19 @@ class PaperTradingStore:
 
     def _try_fill(self, connection, row, account, price: Decimal, now: str) -> None:
         low, high = Decimal(row["entry_low"]), Decimal(row["entry_high"])
-        if not low <= price <= high:
+        if row['market_entry']:
+            if (datetime.fromisoformat(now)-datetime.fromisoformat(row['created_at'])).total_seconds() > 120:
+                self._reject(connection, row['id'], '市价单等待行情超过 120 秒，不追补过期信号', now)
+                return
+            reference = (low + high) / 2
+            if abs(price-reference)/reference > Decimal('0.02'):
+                self._reject(connection, row['id'], '市价偏离参考入场超过 2%', now)
+                return
+            targets = [Decimal(x) for x in json.loads(row['take_profits'])]
+            if (row['side'] == 'long' and (price <= Decimal(row['stop_loss']) or price >= min(targets))) or (row['side'] == 'short' and (price >= Decimal(row['stop_loss']) or price <= max(targets))):
+                self._reject(connection, row['id'], '最新价格已越过止盈或止损，不追单', now)
+                return
+        elif not low <= price <= high:
             return
         snapshot = self._snapshot(connection)
         risk_fraction = Decimal(row["risk_percent"]) / Decimal("100")
@@ -227,8 +452,15 @@ class PaperTradingStore:
             return
         risk_size = risk_budget / stop_distance
         leverage = Decimal(str(row["leverage"]))
+        if row['sizing_mode'] != 'risk':
+            requested_margin = Decimal(row['sizing_value']) if row['sizing_mode'] == 'fixed_usdt' else max(snapshot.equity, ZERO)*Decimal(row['sizing_value'])/100
+            risk_size = requested_margin*leverage/price
+            required = requested_margin + risk_size*price*Decimal(account['fee_rate'])
+            if required > snapshot.available_balance:
+                self._reject(connection, row['id'], '可用余额不足以支付设定保证金及开仓手续费，不缩小订单冒充足额跟单', now)
+                return
         capacity_size = max(snapshot.available_balance, ZERO) * leverage * Decimal("0.98") / price
-        size = min(risk_size, capacity_size).quantize(MONEY, rounding=ROUND_DOWN)
+        size = (min(risk_size, capacity_size) if row['sizing_mode'] == 'risk' else risk_size).quantize(MONEY, rounding=ROUND_DOWN)
         if size <= ZERO:
             self._reject(connection, row["id"], "可用本金不足", now)
             return
@@ -312,6 +544,11 @@ class PaperTradingStore:
         available = initial + realized - fees - used_margin
         return PaperAccount(
             initialized=True,
+            sizing_mode=account['sizing_mode'], fixed_usdt=Decimal(account['fixed_usdt']), position_percent=Decimal(account['position_percent']),
+            simulation_id=account['simulation_id'], lifecycle=account['lifecycle'],
+            started_at=account['started_at'], stopped_at=account['stopped_at'], active_seconds=account['active_seconds'],
+            elapsed_seconds=max(0, ((datetime.fromisoformat(account['stopped_at']) if account['stopped_at'] else datetime.now(UTC)) - datetime.fromisoformat(account['started_at'])).total_seconds()),
+            market_updated_at=account['market_updated_at'], market_error=account['market_error'],
             initial_balance=initial,
             equity=equity,
             available_balance=available,

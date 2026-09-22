@@ -108,6 +108,9 @@ def test_market_contract_order_omits_limit_only_fields(monkeypatch) -> None:
             return {"data": {"orderId": "demo-order", "clientOid": "demo-client"}}
 
         monkeypatch.setattr(client, "_request", request)
+        async def contract(symbol):
+            return {"maxLever": "100", "sizeMultiplier": "0.01", "minTradeNum": "0.01", "pricePlace": "2", "priceEndStep": "1", "minTradeUSDT": "5"}
+        monkeypatch.setattr(client, "contract_config", contract)
         try:
             await client.place_signal_order(
                 signal,

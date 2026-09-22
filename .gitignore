@@ -25,3 +25,10 @@ prototype/dist/
 # OS/editor
 .DS_Store
 Thumbs.db
+
+# Desktop build output and user credentials
+/build/
+/release/
+*.bin
+/desktop-test-data/
+/local-services/

@@ -7,7 +7,7 @@ import { getBitgetAccount } from "./api";
 import "./bitget-account.css";
 
 const accountLabels = {
-  unified: "统一账户", hybrid: "混合账户", basic: "基础模式",
+  unified: "统一账户", hybrid: "混合账户", basic: "基础模式", classic: "经典合约账户",
   advanced: "高级模式", isolated: "逐仓模式", multi_assets: "多资产",
   one_way_mode: "单向持仓", hedge_mode: "双向持仓",
   read_only: "只读", read_and_write: "读写",
@@ -114,7 +114,7 @@ export function BitgetAccountView() {
   return <div className="bitget-account-page">
     <header className="bitget-account-header">
       <div className="account-title-icon"><Wallet weight="fill" /></div>
-      <div className="account-heading"><span>Bitget · 实盘只读</span><h1>资金管理</h1><p>统一查看账户资产、保证金风险、当前持仓与未成交订单。</p></div>
+      <div className="account-heading"><span>Bitget · {account?.environment === 'demo' ? '模拟盘账户' : '实盘只读'}</span><h1>资金管理</h1><p>统一查看账户资产、保证金风险、当前持仓与未成交订单。</p></div>
       <div className={`realtime-account-state ${realtimeConnected ? "online" : "connecting"}`} title={account?.realtime_detail}>
         <i /><span><strong>{realtimeConnected ? "实时连接" : "正在重连"}</strong><small>{realtimeConnected ? realtimeEventAt : account?.realtime_detail || "连接实时频道"}</small></span>
       </div>
