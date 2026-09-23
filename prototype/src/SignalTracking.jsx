@@ -59,8 +59,8 @@ function SignalDetail({ signal }) {
       <div><dt>交易对</dt><dd>{signal.symbol}</dd></div>
       <div><dt>方向</dt><dd>{signal.side === 'long' ? '做多' : '做空'}</dd></div>
       <div><dt>入场区间</dt><dd>{signal.entry_low} — {signal.entry_high}</dd></div>
-      <div><dt>止损</dt><dd>{signal.stop_loss}</dd></div>
-      <div><dt>止盈</dt><dd>{signal.take_profits.join(' / ')}</dd></div>
+      <div><dt>止损</dt><dd>{signal.awaiting_protection ? '临时止损：初始保证金 100%' : signal.stop_loss}</dd></div>
+      <div><dt>止盈</dt><dd>{signal.awaiting_protection ? '等待回复（最多 5 分钟）' : signal.take_profits.join(' / ')}</dd></div>
     </dl><small>模拟盘订单预设止损和第一个止盈目标。</small></section>
     <section className="execution-result"><h3>执行记录</h3><dl>
       <div><dt>状态</dt><dd>{statusLabel[signal.status] || signal.status}</dd></div>
@@ -139,7 +139,7 @@ export function SignalTrackingView({ focusSignalId }) {
     () => new Map(leverageOverrides.map((item) => [item.symbol, item.leverage])),
     [leverageOverrides],
   );
-  const leverageFor = (symbol) => leverageBySymbol.get(symbol) || Number(settings.default_leverage);
+  const leverageFor = (symbol) => leverageBySymbol.has(symbol) ? `${leverageBySymbol.get(symbol)}x 配置值` : '实时最大 × 50%';
   const activeCount = rows.filter((item) => item.status === "submitted").length;
   const visibleRows = rows.filter((item) => {
     if (signalFilter === "executed") return item.status === "submitted";
@@ -239,8 +239,8 @@ export function SignalTrackingView({ focusSignalId }) {
 
         <label className="leverage-setting">
           <span className="setting-label">默认杠杆 · 全仓</span>
-          <span className="number-input"><input type="number" min="1" max="150" step="1" value={settings.default_leverage} onChange={(event) => updateSetting("default_leverage", Math.min(150, Math.max(1, Number(event.target.value))))} /><b>x</b></span>
-          <small>币种覆盖优先，超出上限自动下调</small>
+          <strong>交易所最大杠杆 × 50%</strong>
+          <small>向下取整；币种覆盖优先，不使用旧全局上限</small>
         </label>
       </section>}
 
@@ -278,7 +278,7 @@ export function SignalTrackingView({ focusSignalId }) {
                 <span className="parse-cell"><CheckCircle weight="fill" />解析成功</span>
                 <span><b className={submitted ? "executed-tag" : "waiting-tag"}>{statusLabel[signal.status] || signal.status}</b></span>
                 <span>{systemStatus?.bitget_environment !== 'demo' ? '详见实盘记录' : settings.sizing_mode === "fixed_usdt" ? `${settings.fixed_usdt} USDT` : `${settings.position_percent}%`}</span>
-                <span>{systemStatus?.bitget_environment !== 'demo' ? '详见实盘记录' : `${leverageFor(signal.symbol)}x`}</span>
+                <span>{systemStatus?.bitget_environment !== 'demo' ? '详见实盘记录' : leverageFor(signal.symbol)}</span>
                 <span>{signal.execution_at ? new Date(signal.execution_at).toLocaleTimeString() : "—"}</span>
               </button>
               {expanded ? <SignalDetail signal={signal} settings={settings} effectiveLeverage={leverageFor(signal.symbol)} /> : null}

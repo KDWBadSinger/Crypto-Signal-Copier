@@ -7,6 +7,7 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal, ROUND_DOWN
 from pathlib import Path
 from .database import ManagedConnection
+from .follow_policy import target_sizes, temporary_stop, PROTECTION_WAIT_SECONDS
 
 from .models import (
     PaperAccount,
@@ -105,7 +106,10 @@ class PaperTradingStore:
             for name, declaration in {'source_chat_id': 'INTEGER', 'source_message_id': 'INTEGER',
                                       'management_flags': "TEXT NOT NULL DEFAULT '[]'",
                                       'sizing_mode': "TEXT NOT NULL DEFAULT 'risk'",
-                                      'sizing_value': "TEXT NOT NULL DEFAULT '0'"}.items():
+                                      'sizing_value': "TEXT NOT NULL DEFAULT '0'",
+                                      'awaiting_protection': 'INTEGER NOT NULL DEFAULT 0',
+                                      'entry_deviation': "TEXT NOT NULL DEFAULT '0.02'",
+                                      'protection_deadline': 'TEXT'}.items():
                 if name not in trade_columns:
                     connection.execute(f'ALTER TABLE paper_trades ADD COLUMN {name} {declaration}')
             connection.execute('CREATE TABLE IF NOT EXISTS paper_commands (simulation_id TEXT NOT NULL, chat_id INTEGER NOT NULL, message_id INTEGER NOT NULL, result TEXT NOT NULL, PRIMARY KEY(simulation_id, chat_id, message_id))')
@@ -283,7 +287,7 @@ class PaperTradingStore:
             if cursor.rowcount != 1:
                 raise PaperTradingError("请先初始化程序内模拟账户")
 
-    def enqueue(self, signal: ParsedSignal) -> bool:
+    def enqueue(self, signal: ParsedSignal, *, leverage=None) -> bool:
         if not self.is_initialized():
             raise PaperTradingError("请先初始化程序内模拟账户")
         now = datetime.now(UTC).isoformat()
@@ -310,10 +314,12 @@ class PaperTradingStore:
                     f"paper_{signal.id}", signal.id, signal.symbol, signal.side.value,
                     PaperTradeStatus.PENDING.value, str(signal.entry_low), str(signal.entry_high),
                     str(signal.stop_loss), json.dumps([str(x) for x in signal.take_profits]),
-                    int(account["leverage"]), str(signal.risk_percent or Decimal("1")), now, now,
+                    int(leverage if leverage is not None else account["leverage"]), str(signal.risk_percent or Decimal("1")), now, now,
                 ),
             )
             connection.execute("UPDATE paper_trades SET market_entry=? WHERE signal_id=?", (int(signal.market_entry), signal.id))
+            connection.execute('UPDATE paper_trades SET awaiting_protection=?, entry_deviation=? WHERE signal_id=?',
+                               (int(signal.awaiting_protection),'0.10' if signal.entry_correction else '0.02',signal.id))
             connection.execute('UPDATE paper_trades SET source_chat_id=?, source_message_id=? WHERE signal_id=?',
                                (signal.source_chat_id, signal.source_message_id, signal.id))
             connection.execute('UPDATE paper_trades SET sizing_mode=?, sizing_value=? WHERE signal_id=?',
@@ -376,9 +382,10 @@ class PaperTradingStore:
                 details.append(f'保留指令执行前剩余仓位的 10%；500% 保证金毛收益目标价 {target}；保留止损')
             elif 'tp1' in actions and 'tp1' not in flags and row['next_take_profit'] == 0:
                 count = len(json.loads(row['take_profits']))
-                self._close_size(connection, row, price, Decimal(row['remaining_size'])/count, 'manual_tp1', now, next_take_profit=1)
+                first=target_sizes(Decimal(row['size']),count,MONEY)[0]
+                self._close_size(connection, row, price, min(Decimal(row['remaining_size']),first), 'manual_tp1', now, next_take_profit=1)
                 flags.add('tp1')
-                details.append(f'按实时价格 {price} 执行第一档止盈（原始 {count} 档等分）')
+                details.append(f'按实时价格 {price} 执行第一档止盈（三档按初始数量 40%/40%/20%，其他档数等分）')
             connection.execute('UPDATE paper_trades SET management_flags=? WHERE id=?', (json.dumps(sorted(flags)), trade_id))
             detail = '；'.join(details) or '该减仓阶段已完成，不重复执行'
             connection.execute('INSERT INTO paper_commands VALUES (?, ?, ?, ?)', (account['simulation_id'], chat_id, message_id, detail))
@@ -434,11 +441,11 @@ class PaperTradingStore:
                 self._reject(connection, row['id'], '市价单等待行情超过 120 秒，不追补过期信号', now)
                 return
             reference = (low + high) / 2
-            if abs(price-reference)/reference > Decimal('0.02'):
-                self._reject(connection, row['id'], '市价偏离参考入场超过 2%', now)
+            if abs(price-reference)/reference > Decimal(row['entry_deviation']):
+                self._reject(connection, row['id'], '市价偏离校验参考价超过允许范围', now)
                 return
             targets = [Decimal(x) for x in json.loads(row['take_profits'])]
-            if (row['side'] == 'long' and (price <= Decimal(row['stop_loss']) or price >= min(targets))) or (row['side'] == 'short' and (price >= Decimal(row['stop_loss']) or price <= max(targets))):
+            if not row['awaiting_protection'] and ((row['side'] == 'long' and (price <= Decimal(row['stop_loss']) or price >= min(targets))) or (row['side'] == 'short' and (price >= Decimal(row['stop_loss']) or price <= max(targets)))):
                 self._reject(connection, row['id'], '最新价格已越过止盈或止损，不追单', now)
                 return
         elif not low <= price <= high:
@@ -452,6 +459,9 @@ class PaperTradingStore:
             return
         risk_size = risk_budget / stop_distance
         leverage = Decimal(str(row["leverage"]))
+        if row['awaiting_protection'] and row['sizing_mode']=='risk':
+            # With a 100%-margin stop, the legacy risk budget equals initial margin.
+            risk_size=risk_budget*leverage/price
         if row['sizing_mode'] != 'risk':
             requested_margin = Decimal(row['sizing_value']) if row['sizing_mode'] == 'fixed_usdt' else max(snapshot.equity, ZERO)*Decimal(row['sizing_value'])/100
             risk_size = requested_margin*leverage/price
@@ -465,6 +475,10 @@ class PaperTradingStore:
             self._reject(connection, row["id"], "可用本金不足", now)
             return
         opening_fee = price * size * Decimal(account["fee_rate"])
+        if row['awaiting_protection']:
+            stop=temporary_stop(price,size,price*size/leverage,row['side'],account['fee_rate'],MONEY)
+            deadline=(datetime.fromisoformat(now)+timedelta(seconds=PROTECTION_WAIT_SECONDS)).isoformat()
+            connection.execute('UPDATE paper_trades SET stop_loss=?,protection_deadline=? WHERE id=?',(str(stop),deadline,row['id']))
         connection.execute(
             """
             UPDATE paper_trades SET status='open', entry_price=?, size=?, remaining_size=?,
@@ -480,6 +494,9 @@ class PaperTradingStore:
         )
 
     def _apply_exit_rules(self, connection, row, price: Decimal, now: str) -> None:
+        if row['awaiting_protection'] and datetime.fromisoformat(now)>=datetime.fromisoformat(row['protection_deadline']):
+            self._close_size(connection,row,price,Decimal(row['remaining_size']),'protection_timeout',now)
+            return
         side = row["side"]
         stop = Decimal(row["stop_loss"])
         stop_hit = price <= stop if side == SignalSide.LONG.value else price >= stop
@@ -495,7 +512,7 @@ class PaperTradingStore:
             if not hit:
                 break
             targets_left = len(targets) - next_index
-            close_size = remaining if targets_left == 1 else remaining / Decimal(targets_left)
+            close_size = remaining if targets_left == 1 else min(remaining,target_sizes(Decimal(row['size']),len(targets),MONEY)[next_index])
             row = self._close_size(
                 connection, row, price, close_size, f"take_profit_{next_index + 1}", now,
                 next_take_profit=next_index + 1,
@@ -504,6 +521,22 @@ class PaperTradingStore:
             next_index += 1
             if remaining <= ZERO:
                 break
+
+    def receive_protection(self,signal,price):
+        now=datetime.now(UTC).isoformat()
+        with self._lock,self._connect() as connection:
+            connection.execute('BEGIN IMMEDIATE')
+            row=connection.execute('SELECT * FROM paper_trades WHERE signal_id=?',(signal.id,)).fetchone()
+            if not row or row['status']!='open' or not row['awaiting_protection']: return False
+            if signal.source_chat_id!=row['source_chat_id'] or signal.symbol!=row['symbol'] or signal.side!=row['side']:
+                raise PaperTradingError('保护回复与模拟仓位归属不符')
+            if datetime.fromisoformat(now)>=datetime.fromisoformat(row['protection_deadline']):
+                self._close_size(connection,row,price,Decimal(row['remaining_size']),'protection_timeout',now)
+                return False
+            ParsedSignal.model_validate({**signal.model_dump(),'entry_low':price,'entry_high':price})
+            connection.execute('UPDATE paper_trades SET stop_loss=?,take_profits=?,awaiting_protection=0,updated_at=? WHERE id=?',
+                               (str(signal.stop_loss),json.dumps([str(t) for t in signal.take_profits]),now,row['id']))
+            return True
 
     def _close_size(
         self, connection, row, price: Decimal, close_size: Decimal, reason: str,
@@ -586,6 +619,7 @@ class PaperTradingStore:
             remaining_size=remaining, stop_loss=Decimal(row["stop_loss"]),
             take_profits=[Decimal(x) for x in json.loads(row["take_profits"])],
             next_take_profit=int(row["next_take_profit"]), leverage=int(row["leverage"]),
+            awaiting_protection=bool(row['awaiting_protection']),protection_deadline=row['protection_deadline'],
             risk_percent=Decimal(row["risk_percent"]), margin=margin, unrealized_pnl=unrealized,
             realized_pnl=Decimal(row["realized_pnl"]), fees=Decimal(row["fees"]),
             close_reason=row["close_reason"], created_at=datetime.fromisoformat(row["created_at"]),

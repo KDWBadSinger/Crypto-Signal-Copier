@@ -31,7 +31,7 @@ from .models import (
     SystemStatus,
     TelegramConnectionRequest,
 )
-from .parser import parse_signal
+from .parser import parse_signal, PARSER_VERSION
 from .paper import PaperTradingError, PaperTradingStore
 from .storage import SignalStore
 from .telegram_client import TelegramSignalClient
@@ -59,7 +59,7 @@ class CopierService:
         self.uta_runtime = UtaRuntime(self.bitget,self.store)
         self.paper = PaperTradingStore(settings.database_path)
         self._message_subscribers: set[asyncio.Queue] = set()
-        self.telegram = TelegramSignalClient(settings, self.ingest_signal, self.record_telegram_message, self.store.get_message, self.manage_telegram_position)
+        self.telegram = TelegramSignalClient(settings, self.ingest_signal, self.record_telegram_message, self.store.get_message, self.manage_telegram_position, self.store.canonicalize_signal, self.parse_live_signal)
         self._execution_lock = asyncio.Lock()
         self._paper_monitor_task: asyncio.Task | None = None
         self._paper_lock = asyncio.Lock()
@@ -93,6 +93,9 @@ class CopierService:
         )
 
     async def start(self) -> None:
+        if self.store.get_setting('telegram_parser_version')!=PARSER_VERSION:
+            await self.reparse_cached_messages()
+            self.store.set_setting('telegram_parser_version',PARSER_VERSION)
         await self.uta_runtime.start()
         self.paper.runtime_start()
         await self.market_feed.start()
@@ -130,7 +133,48 @@ class CopierService:
         await self.bitget_stream.stop()
         await self.bitget.close()
 
+    async def parse_live_signal(self,text,message,parent=None):
+        from .parser import parse_signal, normalize_signal_text, _extract_symbol
+        existing=self.store.get(parent['signal_id']) if parent and parent.get('signal_id') else None
+        if not (existing and existing.entry_correction) and not self.uta_runtime.enabled and not (self.paper.is_initialized() and self.paper.should_auto_execute(message['source_name'])):
+            return parse_signal(text,source_name=message['source_name'],chat_id=message['chat_id'],message_id=message['message_id'])
+        symbol=_extract_symbol(normalize_signal_text(text))
+        if not symbol: raise ValueError('未识别唯一交易币种')
+        if parent and not existing:
+            raise ValueError('没有本程序实时开仓意图，回复不追补新单')
+        # Protection replies use the pinned entry reference, not a moving quote.
+        # Fresh current geometry is checked separately before modifying protection.
+        price=existing.reference_entry if existing and existing.entry_correction else await self.public_price(symbol)
+        return parse_signal(text,source_name=message['source_name'],chat_id=message['chat_id'],
+                            message_id=message['message_id'],market_price=price,allow_pending=True)
+
     async def ingest_signal(self, signal: ParsedSignal) -> None:
+        previous=self.store.get(signal.id)
+        if previous and previous.entry_correction and not signal.awaiting_protection:
+            results=[]
+            try:
+                price=await self.public_price(signal.symbol)
+                async with self._paper_lock:
+                    if self.paper.receive_protection(signal,price): results.append('模拟仓位保护已更新')
+            except (ValueError,PaperTradingError,BitgetError) as exc:
+                self.store.add_audit(signal.id,'paper_protection_rejected',str(exc))
+            if self.uta_runtime.management_authorized:
+                try:
+                    self.uta_runtime._authorize_write()
+                    row=await self.uta_runtime.engine.receive_protection(signal)
+                    if row:
+                        self.uta_runtime._sync_signal(row)
+                        results.append('实盘原仓位保护已更新')
+                except (ValueError,BitgetError) as exc:
+                    self.store.add_audit(signal.id,'uta_protection_rejected',str(exc))
+            if results:
+                current=self.store.get(signal.id)
+                completed=current.model_copy(update={'awaiting_protection':False,'stop_loss':signal.stop_loss,
+                    'take_profits':signal.take_profits,'raw_text':signal.raw_text})
+                self.store.upsert(completed)
+            # All consumers retain durable execution state; a reply never opens.
+            self.store.add_audit(signal.id,'protection_reply','；'.join(results) or '未更新：持仓不存在、已结束、重复回复或保护条件不满足')
+            return
         inserted = self.store.upsert(signal, update=False)
         if inserted:
             try:
@@ -141,20 +185,23 @@ class CopierService:
         if inserted and self.paper.is_initialized() and self.paper.should_auto_execute(signal.source_name):
             try:
                 await self.paper_execute(signal)
-            except (PaperTradingError, BitgetError) as exc:
+            except (PaperTradingError, BitgetError, ValueError) as exc:
                 self.store.add_audit(signal.id, "paper_execution_failed", str(exc))
         if inserted and not self.settings.bitget_is_demo:
             try:
                 if signal.source_chat_id not in self.settings.telegram_allowed_chat_ids:
                     raise BitgetError('仅执行已选择 Telegram 频道的实时信号')
                 override=next((item for item in self._leverage_overrides.items if item.symbol==signal.symbol),None)
-                requested=override.leverage if override else self.uta_runtime.limits().max_leverage
+                requested=override.leverage if override else None
                 await self.uta_runtime.ingest(signal,requested)
                 self.store.add_audit(signal.id,'uta_execution','实盘开单已进入持久化交易所核对流程')
             except (ValueError,BitgetError) as exc:
                 self.store.add_audit(signal.id,'auto_execution_blocked',str(exc))
             return
         if not inserted or self.manual_review_enabled:
+            return
+        if signal.awaiting_protection:
+            self.store.add_audit(signal.id,'auto_execution_blocked','先开仓后补保护仅接入本地模拟及 UTA 实盘，不向经典 V2 模拟盘发送无完整保护订单')
             return
         if not self.settings.bitget_is_demo:
             self.store.add_audit(signal.id, "auto_execution_blocked", "实盘仅支持只读连接")
@@ -174,9 +221,11 @@ class CopierService:
             )
             return
         try:
-            requested_leverage = self.resolve_requested_leverage(signal.symbol)
-            _, maximum_leverage = await self.bitget.symbol_leverage_limits(signal.symbol)
-            effective_leverage = min(requested_leverage, maximum_leverage)
+            from .follow_policy import exchange_leverage
+            override=next((item for item in self._leverage_overrides.items if item.symbol==signal.symbol),None)
+            requested_leverage = override.leverage if override else None
+            minimum_leverage, maximum_leverage = await self.bitget.symbol_leverage_limits(signal.symbol)
+            effective_leverage = exchange_leverage(maximum_leverage,minimum_leverage,requested_leverage)
             order_size = await self._resolve_auto_order_size(signal, effective_leverage)
             await self.bitget.set_cross_leverage(signal.symbol, effective_leverage)
             self.store.add_audit(
@@ -203,14 +252,18 @@ class CopierService:
 
     async def paper_execute(self, signal: ParsedSignal) -> None:
         await self.license.allow_new_order()
+        minimum,maximum=await self.bitget.symbol_leverage_limits(signal.symbol)
+        from .follow_policy import exchange_leverage
+        override=next((item for item in self._leverage_overrides.items if item.symbol==signal.symbol),None)
+        effective=exchange_leverage(maximum,minimum,override.leverage if override else None)
         async with self._paper_lock:
-            inserted = self.paper.enqueue(signal)
+            inserted = self.paper.enqueue(signal,leverage=effective)
         if not inserted:
             raise PaperTradingError("该信号已经加入程序内模拟账户")
         self.store.add_audit(
             signal.id,
             "paper_order_created",
-            "使用 Bitget 实盘行情监控入场区间；不会向交易所提交订单",
+            f"使用 Bitget 实盘行情；不会向交易所提交订单。交易所最大杠杆 {maximum}x，实际 {effective}x（{'单币种配置' if override else '最大杠杆 50%，向下取整'}）",
         )
         await self.refresh_paper_market([signal.symbol])
 
@@ -457,7 +510,7 @@ class CopierService:
         )
         await self.telegram.stop()
         self.settings = candidate
-        self.telegram = TelegramSignalClient(candidate, self.ingest_signal, self.record_telegram_message, self.store.get_message, self.manage_telegram_position)
+        self.telegram = TelegramSignalClient(candidate, self.ingest_signal, self.record_telegram_message, self.store.get_message, self.manage_telegram_position, self.store.canonicalize_signal, self.parse_live_signal)
         await self.telegram.start()
         return await self.connection_overview()
 
@@ -484,8 +537,35 @@ class CopierService:
                 for chat_id in sorted(self.settings.telegram_allowed_chat_ids)]
 
     def record_telegram_message(self, message: dict) -> None:
-        self.store.record_message(message)
+        if message.get('_preview_only') or message.get('origin')=='repair':
+            self.store.update_message_preview(message)
+        else:
+            self.store.record_message(message)
         self.notify_telegram_subscribers()
+
+    async def reparse_cached_messages(self):
+        """Local-only migration: no on_signal/on_management/network calls."""
+        count=0
+        async with self.telegram._dispatch_lock:
+            for cached in reversed(self.store.messages(10000)):
+                if cached.get('origin')=='edit' or cached.get('status') in {'managed','management_rejected','management','received','media'}:
+                    continue
+                # A user-triggered repair must not retire a freshly received
+                # entry while its live protection reply is still on the way.
+                if self.telegram.connected:
+                    try:
+                        if (datetime.now(UTC)-datetime.fromisoformat(cached['sent_at'])).total_seconds()<900:
+                            continue
+                    except (KeyError,TypeError,ValueError):
+                        continue
+                message={k:v for k,v in cached.items() if k not in {'parsed_signal','merged_messages','duplicate_of','signal_id'}}
+                message.update(origin='repair',display_only=True,reparsed_at=datetime.now(UTC).isoformat())
+                try: await self.telegram.inspect_message(message)
+                except ValueError as exc: message.update(status='unparsed',detail=str(exc))
+                self.store.update_message_preview(message)
+                count+=1
+        self.notify_telegram_subscribers()
+        return count
 
     def notify_telegram_subscribers(self) -> None:
         for queue in tuple(self._message_subscribers):
@@ -509,6 +589,8 @@ class CopierService:
                 if signal.status == SignalStatus.PENDING_REVIEW:
                     message["execution_note"] = ("自动跟单未启用" if self.manual_review_enabled else
                         "请查看执行记录：模拟盘可能未连接或未允许下单")
+            elif message.get('display_only'):
+                message['execution_note']='旧消息已用新版规则重新解析，仅供核对，不补发订单'
             elif message.get("origin") == "history":
                 message["execution_note"] = "历史补读，仅供查看，不触发跟单"
             elif message.get("origin") == "edit":
@@ -519,7 +601,7 @@ class CopierService:
             recent = self.store.messages(1, channel["id"])
             channel["last_message_at"] = recent[0].get("sent_at") or recent[0]["received_at"] if recent else None
         return {"channels": channels, "messages": messages, "connected": connected, "detail": detail,
-                "auto_execution_enabled": not self.manual_review_enabled,
+                "auto_execution_enabled": (not self.manual_review_enabled) if self.settings.bitget_is_demo else self.uta_runtime.enabled,
                 "updated_at": datetime.now(UTC).isoformat()}
 
     @staticmethod
@@ -809,6 +891,8 @@ class CopierService:
     async def _approve_locked(
         self, signal: ParsedSignal, request: ApproveSignalRequest
     ) -> ParsedSignal:
+        if signal.awaiting_protection:
+            raise ValueError('市价开仓意图只能由专用临时保护生命周期执行，不能走普通审批接口')
         if signal.status not in {
             SignalStatus.PENDING_REVIEW,
             SignalStatus.APPROVED_DRY_RUN,

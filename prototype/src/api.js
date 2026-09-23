@@ -27,6 +27,7 @@ export const saveTelegramChannels = (chat_ids) => apiRequest('/api/telegram/chan
 export const getTelegramMessages = (signal) => apiRequest('/api/telegram/messages', { signal });
 export const getTelegramInbox = (chatId, signal) => apiRequest(`/api/telegram/inbox${chatId ? `?chat_id=${chatId}` : ''}`, { signal });
 export const syncTelegramHistory = (chatId) => apiRequest(`/api/telegram/channels/${chatId}/history`, { method: 'POST' });
+export const reparseTelegramCache = () => apiRequest('/api/telegram/reparse', { method: 'POST' });
 
 export function getMarketOverview(signal) {
   return apiRequest("/api/market/overview", { signal });

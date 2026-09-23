@@ -226,6 +226,11 @@ async def telegram_inbox(chat_id: int | None = None, limit: int = Query(default=
     return service.telegram_inbox(chat_id, limit)
 
 
+@app.post('/api/telegram/reparse')
+async def reparse_telegram_cache():
+    return {'reparsed':await service.reparse_cached_messages(),'orders_sent':0}
+
+
 @app.post("/api/telegram/channels/{chat_id}/history")
 async def telegram_history(chat_id: int, limit: int = Query(default=30, ge=1, le=100)):
     count = await telegram_call(service.telegram.sync_history(chat_id, limit))
