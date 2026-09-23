@@ -11,7 +11,7 @@ from telethon.sessions import StringSession
 
 from .config import DATA_HOME, Settings
 from .models import ParsedSignal
-from .parser import parse_signal, is_entry_fragment, merge_reply
+from .parser import parse_signal, is_entry_fragment, merge_reply, PARSER_VERSION
 from .secrets import read_secrets, write_secrets
 from .management import parse_management
 
@@ -20,12 +20,14 @@ SignalHandler = Callable[[ParsedSignal], Awaitable[None]]
 
 
 class TelegramSignalClient:
-    def __init__(self, settings: Settings, on_signal: SignalHandler, on_message=None, has_message=None, on_management=None) -> None:
+    def __init__(self, settings: Settings, on_signal: SignalHandler, on_message=None, has_message=None, on_management=None, canonicalize=None, parse_live=None) -> None:
         self.settings = settings
         self.on_signal = on_signal
         self.on_message = on_message
         self.has_message = has_message
         self.on_management = on_management
+        self.canonicalize = canonicalize
+        self.parse_live = parse_live
         self.channel_names: dict[int, str] = {}
         self._history_lock = asyncio.Lock()
         self._dispatch_lock = asyncio.Lock()
@@ -205,18 +207,33 @@ class TelegramSignalClient:
             return None
 
     async def inspect_message(self, message: dict) -> ParsedSignal | None:
+        message['parser_version']=PARSER_VERSION
         command = parse_management(message['text'])
         if command:
             message.update(status='management', management=command, detail='持仓管理指令；历史与编辑仅预览，不执行')
             return None
         parent_id = message.get("reply_to_message_id")
         if not parent_id:
-            return self.inspect_signal(message)
+            signal=self.inspect_signal(message)
+            if self.parse_live and message.get('origin')=='live' and self._fresh(message):
+                try:
+                    signal=await self.parse_live(message['text'],message)
+                    message.update(status='waiting' if signal.awaiting_protection else 'parsed',signal_id=signal.id,
+                                   parsed_signal=signal.model_dump(mode='json'),detail='实时市价意图已校验；执行及临时保护结果请查看对应订单')
+                except ValueError as exc:
+                    if signal or (is_entry_fragment(message['text']) and not str(exc).startswith('missing required fields:')):
+                        message.update(status='invalid',detail=str(exc))
+                    signal=None
+            if signal and self.canonicalize:
+                signal=self.canonicalize(signal,message,message)
+                message.update(signal_id=signal.id,parsed_signal=signal.model_dump(mode='json'))
+                if message.get('duplicate_of'): message['status']='duplicate'
+            return signal
         if message.get("reply_to_chat_id", message["chat_id"]) != message["chat_id"]:
             message.update(status="unparsed", detail="跨频道回复不自动合并，避免同号消息错误关联")
             return None
         parent = self.has_message(message["chat_id"], parent_id) if self.has_message else None
-        if parent is None and self.client and hasattr(self.client, "get_messages"):
+        if parent is None and message.get('origin')!='repair' and self.client and hasattr(self.client, "get_messages"):
             raw = await self.client.get_messages(message["chat_id"], ids=parent_id)
             if raw:
                 parent = self.describe_message(raw, message["chat_id"], message["source_name"], origin="history")
@@ -229,10 +246,19 @@ class TelegramSignalClient:
             return None
         try:
             combined = merge_reply(parent["text"], message["text"])
-            signal = parse_signal(combined, source_name=message["source_name"],
-                                  chat_id=message["chat_id"], message_id=parent_id)
+            if self.parse_live and message.get('origin')=='live' and self._fresh(message) and parent.get('origin')=='live' and not parent.get('display_only'):
+                signal=await self.parse_live(combined,{**message,'message_id':parent_id},parent)
+                message['protection_update']=bool(parent.get('parsed_signal',{}).get('awaiting_protection'))
+            else:
+                signal = parse_signal(combined, source_name=message["source_name"],
+                                      chat_id=message["chat_id"], message_id=parent_id)
         except ValueError as exc:
-            message.update(status="unparsed", detail=str(exc))
+            message.update(status="invalid" if '参数冲突' in str(exc) else "unparsed", detail=str(exc))
+            if '参数冲突' in str(exc) and self.on_message and message['origin']!='edit':
+                parent.update(status='invalid',detail=f"已收到保护回复 #{message['message_id']}，但{exc}")
+                if message['origin']=='repair':
+                    parent.update(_preview_only=True,display_only=True,reparsed_at=message.get('reparsed_at'),parser_version=PARSER_VERSION)
+                self.on_message(parent)
             return None
         sources = [{"message_id": parent_id, "text": parent["text"]},
                    {"message_id": message["message_id"], "text": message["text"]}]
@@ -244,14 +270,24 @@ class TelegramSignalClient:
                 elapsed = (datetime.fromisoformat(message["sent_at"]) - datetime.fromisoformat(parent["sent_at"])).total_seconds()
             except (TypeError, ValueError):
                 elapsed = -1
-            if parent.get("origin") != "live" or not 0 <= elapsed <= 900:
+            if parent.get("origin") != "live" or parent.get('display_only') or not 0 <= elapsed <= 900:
                 message.update(status="stale", detail="合并仅供查看：开单不是实时收到，或回复间隔超过 15 分钟，不自动跟单")
                 return None
+        if self.canonicalize:
+            try: signal=self.canonicalize(signal,message,parent)
+            except ValueError as exc:
+                message.update(status='unparsed',detail=str(exc))
+                return None
+            message.update(signal_id=signal.id,parsed_signal=signal.model_dump(mode='json'))
+            if message.get('duplicate_of'): message['status']='duplicate'
         # The entry message retains its original text while pointing to the same order.
         # Edited previews never replace original correlation/execution evidence.
-        if message["origin"] != "edit" and not parent.get("merged_messages"):
-            parent.update(status="parsed", signal_id=signal.id, parsed_signal=signal.model_dump(mode="json"),
+        if message["origin"] != "edit":
+            parent.update(status=message['status'], signal_id=signal.id, parsed_signal=signal.model_dump(mode="json"),
                           merged_messages=sources, detail=message["detail"])
+            if message.get('duplicate_of'): parent['duplicate_of']=message['duplicate_of']
+            if message['origin']=='repair':
+                parent.update(_preview_only=True,display_only=True,reparsed_at=message.get('reparsed_at'),parser_version=PARSER_VERSION)
             if self.on_message:
                 self.on_message(parent)
         return signal
@@ -320,13 +356,15 @@ class TelegramSignalClient:
                         message.update(status='stale', detail='管理指令时间无效或超过 120 秒，只记录不执行')
                     elif event.chat_id in self.settings.telegram_allowed_chat_ids and self.on_management:
                         await self.on_management(message)
-            elif signal and sent_at and (datetime.now(UTC) - sent_at).total_seconds() > 120:
+            elif signal and not self._fresh(message):
                 message.update(status="stale", detail="消息超过 120 秒，只记录不跟单")
+            elif signal and message.get('duplicate_of') and not message.get('protection_update'):
+                message['detail']+='；本条不再次触发交易执行'
             elif signal:
                 if self.on_message:
                     self.on_message(message)
                 async with self._dispatch_lock:
-                    if sent_at and (datetime.now(UTC) - sent_at).total_seconds() > 120:
+                    if not self._fresh(message):
                         message.update(status="stale", detail="处理队列等待后消息已超过 120 秒，不跟单")
                     elif event.chat_id in self.settings.telegram_allowed_chat_ids:
                         await self.on_signal(signal)
@@ -344,3 +382,10 @@ class TelegramSignalClient:
     def state(self) -> tuple[bool, str]:
         online = self.connected and self.client is not None and self.client.is_connected()
         return online, self.detail if online or not self.connected else "Telegram 正在重连"
+
+    @staticmethod
+    def _fresh(message):
+        try:
+            return 0 <= (datetime.now(UTC)-datetime.fromisoformat(message['sent_at'])).total_seconds() <= 120
+        except (KeyError,TypeError,ValueError):
+            return False

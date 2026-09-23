@@ -75,13 +75,13 @@ export function LeverageOverridesView() {
   return (
     <div className="leverage-page">
       <header className="leverage-header">
-        <div><h1>币种杠杆覆盖</h1><p>为特定 USDT 永续合约设置独立杠杆；未配置的币种使用信号追踪中的默认值。</p></div>
+        <div><h1>币种杠杆覆盖</h1><p>为特定 USDT 永续合约设置独立杠杆；未配置币种采用交易所实时最大杠杆的 50%，向下取整。</p></div>
         <div className="margin-mode"><CheckCircle weight="fill" /><span><small>保证金模式</small><strong>全仓</strong></span></div>
       </header>
 
       <section className="leverage-summary">
-        <div><Gauge size={28} /><span><small>当前默认杠杆</small><strong>{defaultLeverage}x</strong></span></div>
-        <p>执行优先级：币种覆盖 → 默认杠杆 → Bitget 实时上限。若目标值超过交易所限制，系统会自动下调。</p>
+        <div><Gauge size={28} /><span><small>未配置币种默认规则</small><strong>最大杠杆 × 50%</strong></span></div>
+        <p>例如交易所最大 100x → 默认 50x，125x → 62x。单币种配置优先，超出交易所限制时下调。原 30x 及全局上限不再应用；读取限制失败则拒单。适用于本地模拟及交易所自动跟单。</p>
       </section>
 
       <form className="override-form" onSubmit={addOverride}>
@@ -105,7 +105,7 @@ export function LeverageOverridesView() {
             <button type="button" aria-label={`删除 ${item.symbol} 覆盖`} disabled={saving} onClick={() => persist(items.filter((entry) => entry.symbol !== item.symbol), `${item.symbol} 杠杆覆盖已删除`)}><Trash /></button>
           </div>;
         })}
-        {itemMap.size === 0 ? <div className="override-empty"><Gauge size={30} /><strong>还没有单币种覆盖</strong><span>所有交易对当前都使用默认杠杆 {defaultLeverage}x</span></div> : null}
+        {itemMap.size === 0 ? <div className="override-empty"><Gauge size={30} /><strong>还没有单币种覆盖</strong><span>所有交易对按各自交易所最大杠杆的 50% 自动计算</span></div> : null}
       </section>
     </div>
   );

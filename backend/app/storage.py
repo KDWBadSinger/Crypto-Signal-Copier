@@ -51,6 +51,14 @@ class SignalStore:
                     received_at TEXT NOT NULL,
                     PRIMARY KEY(chat_id, message_id)
                 );
+                CREATE TABLE IF NOT EXISTS telegram_signal_aliases (
+                    chat_id INTEGER NOT NULL, root_id INTEGER NOT NULL,
+                    fingerprint TEXT NOT NULL, sent_at REAL NOT NULL,
+                    canonical_root INTEGER NOT NULL, canonical_signal TEXT NOT NULL,
+                    PRIMARY KEY(chat_id, root_id)
+                );
+                CREATE INDEX IF NOT EXISTS signal_alias_fingerprint
+                    ON telegram_signal_aliases(chat_id, fingerprint, sent_at);
                 """
             )
 
@@ -168,6 +176,77 @@ class SignalStore:
         with self._connect() as connection:
             row = connection.execute("SELECT payload FROM telegram_messages WHERE chat_id=? AND message_id=?", (chat_id, message_id)).fetchone()
         return json.loads(row["payload"]) if row else None
+
+    def canonicalize_signal(self,signal,message,root):
+        """Exact full-parameter duplicates, same channel, root times <=120s.
+
+        Persistent transaction makes two different Telegram IDs share one order
+        identity. Never coalesce merely by symbol, or chain the time window.
+        History can reserve a display identity, but never dispatch an order.
+        """
+        from .parser import signal_fingerprint,SignalParseError
+        if message.get('origin')=='edit': return signal
+        try:
+            sent=datetime.fromisoformat(root['sent_at'])
+            if sent.tzinfo is None: return signal
+            at=sent.timestamp()
+        except (KeyError,TypeError,ValueError): return signal
+        chat,identifier=signal.source_chat_id,signal.source_message_id
+        # Entry-only duplicates must share identity before either reply exists.
+        # Full replies resolve this durable identity; they never create a second entry.
+        with self._connect() as conn:
+            conn.execute('CREATE TABLE IF NOT EXISTS telegram_entry_aliases (chat INTEGER, root INTEGER, fingerprint TEXT, at REAL, canonical_root INTEGER, signal TEXT, PRIMARY KEY(chat,root))')
+            conn.execute('BEGIN IMMEDIATE')
+            early=conn.execute('SELECT * FROM telegram_entry_aliases WHERE chat=? AND root=?',(chat,identifier)).fetchone()
+            if signal.awaiting_protection and not early:
+                import hashlib
+                original=(signal.entry_correction or {}).get('original',str(signal.reference_entry))
+                key=hashlib.sha256(f'{signal.symbol}|{signal.side}|{original}'.encode()).hexdigest()
+                prior=conn.execute('SELECT * FROM telegram_entry_aliases WHERE chat=? AND fingerprint=? AND root=canonical_root AND at BETWEEN ? AND ? ORDER BY at,root LIMIT 1',(chat,key,at-120,at+120)).fetchone()
+                conn.execute('INSERT INTO telegram_entry_aliases VALUES (?,?,?,?,?,?)',(chat,identifier,key,at,prior['canonical_root'] if prior else identifier,prior['signal'] if prior else signal.id))
+                early=conn.execute('SELECT * FROM telegram_entry_aliases WHERE chat=? AND root=?',(chat,identifier)).fetchone()
+        if early:
+            if early['canonical_root']!=identifier:
+                message['duplicate_of']=early['canonical_root']
+                message['detail']+='；与同频道 120 秒内相同开仓意图共用订单，保护回复更新原仓位'
+            return signal.model_copy(update={'id':early['signal']})
+        fingerprint=signal_fingerprint(signal)
+        with self._connect() as conn:
+            conn.execute('BEGIN IMMEDIATE')
+            alias=conn.execute('SELECT * FROM telegram_signal_aliases WHERE chat_id=? AND root_id=?',(chat,identifier)).fetchone()
+            if alias and alias['fingerprint']!=fingerprint:
+                raise SignalParseError('同一开单消息的保护参数发生变化，仅供核对，不作为新开单执行')
+            if not alias:
+                canonical=conn.execute('SELECT * FROM telegram_signal_aliases WHERE chat_id=? AND fingerprint=? AND canonical_root=root_id AND sent_at BETWEEN ? AND ? ORDER BY sent_at,root_id LIMIT 1',
+                                       (chat,fingerprint,at-120,at+120)).fetchone()
+                values=(chat,identifier,fingerprint,at,canonical['canonical_root'] if canonical else identifier,
+                        canonical['canonical_signal'] if canonical else signal.id)
+                conn.execute('INSERT INTO telegram_signal_aliases VALUES (?,?,?,?,?,?)',values)
+                alias=conn.execute('SELECT * FROM telegram_signal_aliases WHERE chat_id=? AND root_id=?',(chat,identifier)).fetchone()
+        if alias['canonical_root']!=identifier:
+            signal=signal.model_copy(update={'id':alias['canonical_signal']})
+            message['duplicate_of']=alias['canonical_root']
+            message['detail']+=f"；与开单 #{alias['canonical_root']} 的完整参数一致且开单间隔不超过 120 秒，作为重复信号，不重复下单"
+        return signal
+
+    def update_message_preview(self,message):
+        """Update cached analysis only. Never replace source/origin/order evidence."""
+        fields={'status','detail','parsed_signal','merged_messages','duplicate_of','display_only','reparsed_at','parser_version'}
+        with self._connect() as conn:
+            row=conn.execute('SELECT payload FROM telegram_messages WHERE chat_id=? AND message_id=?',
+                             (message['chat_id'],message['message_id'])).fetchone()
+            if not row: return
+            existing=json.loads(row['payload'])
+            for key in fields:
+                if key in message: existing[key]=message[key]
+                else: existing.pop(key,None)
+            # Preserve an existing executed signal's reference, including legacy
+            # duplicates that may already have traded before this fix.
+            if not existing.get('signal_id') or not conn.execute('SELECT 1 FROM signals WHERE id=?',(existing['signal_id'],)).fetchone():
+                if message.get('signal_id'): existing['signal_id']=message['signal_id']
+                else: existing.pop('signal_id',None)
+            conn.execute('UPDATE telegram_messages SET payload=? WHERE chat_id=? AND message_id=?',
+                         (json.dumps(existing,ensure_ascii=False),message['chat_id'],message['message_id']))
 
     def record_message(self, payload: dict) -> None:
         with self._connect() as connection:

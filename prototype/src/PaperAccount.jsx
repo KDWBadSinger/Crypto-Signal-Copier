@@ -209,18 +209,18 @@ export function PaperAccountView() {
           <label>定仓方式<select value={sizingMode} onChange={e => setSizingMode(e.target.value)}><option value="fixed_usdt">每单固定保证金</option><option value="position_percent">账户权益百分比保证金</option><option value="risk">按信号风险与止损距离</option></select></label>
           {sizingMode === 'fixed_usdt' && <label>每单保证金（USDT）<input type="number" min="0.01" step="0.01" value={fixedUsdt} onChange={e => setFixedUsdt(e.target.value)} /></label>}
           {sizingMode === 'position_percent' && <label>每单权益比例（%，最多 10）<input type="number" min="0.01" max="10" step="0.1" value={positionPercent} onChange={e => setPositionPercent(e.target.value)} /></label>}
-          <label>新单模拟杠杆<input type="number" min="1" max="100" step="1" value={leverage} onChange={e => setLeverage(e.target.value)} /></label>
+          <div>新单杠杆：币种杠杆页配置优先；未配置采用交易所最大杠杆的 50%，不再使用旧全局倍数。</div>
           {account?.initialized && !creating && <button disabled={saving || loading} onClick={async () => { setSaving(true); setError(''); try { setAccount(await savePaperSizing(sizing)); } catch(e) { setError(e.message); } finally { setSaving(false); } }}>保存新单设置</button>}
         </div>
-        <p>{sizingMode === 'risk' ? '数量 = 当前权益 × 信号风险比例 ÷ 止损距离；风险比例缺省为 1%，不是每单固定投入 1%。' : sizingMode === 'fixed_usdt' ? `按当前输入：每单保证金 ${fixedUsdt} USDT，名义持仓约 ${Number(fixedUsdt)*Number(leverage)} USDT；另扣开仓手续费。` : '以成交时权益计算保证金；余额不足则拒绝开仓，不擅自缩小订单。'}</p>
-        {account?.initialized && !creating && <small>当前生效：{account.sizing_mode === 'risk' ? '风险定仓' : account.sizing_mode === 'fixed_usdt' ? `${account.fixed_usdt} USDT 保证金/单` : `权益 ${account.position_percent}% 保证金/单`} · {account.leverage} 倍杠杆</small>}
+        <p>{sizingMode === 'risk' ? '完整信号按止损距离定仓；市价先开仓时将权益 × 风险比例作为保证金。风险比例缺省为 1%。' : sizingMode === 'fixed_usdt' ? `每单保证金 ${fixedUsdt} USDT，名义持仓 = 保证金 × 该币种实际杠杆；另扣开仓手续费。` : '以成交时权益计算保证金；余额不足则拒绝开仓，不擅自缩小订单。'}</p>
+        {account?.initialized && !creating && <small>当前生效：{account.sizing_mode === 'risk' ? '风险定仓' : account.sizing_mode === 'fixed_usdt' ? `${account.fixed_usdt} USDT 保证金/单` : `权益 ${account.position_percent}% 保证金/单`} · 每笔成交记录显示实际杠杆</small>}
       </section>}
       {!account?.initialized || creating ? (
         <section className="paper-setup">
           <div className="setup-visual"><Wallet size={42} weight="duotone" /></div>
           <div className="setup-copy">
             <span>第一步</span><h2>创建你的程序内模拟账户</h2>
-            <p>输入虚拟本金，并在上方设置每单保证金和杠杆。下方选择需要跟随的频道。</p>
+            <p>输入虚拟本金并设置每单保证金；杠杆遵循“币种杠杆”页规则。下方选择需要跟随的频道。</p>
           </div>
           <label>自定义模拟 ID<input maxLength={64} placeholder="例如 Mia-30天测试（留空自动生成）" value={simulationId} onChange={event => setSimulationId(event.target.value)} /></label>
           <label>初始本金（USDT）<input type="number" min="1" step="100" value={initialBalance} onChange={(event) => setInitialBalance(event.target.value)} /></label>
@@ -253,7 +253,7 @@ export function PaperAccountView() {
               <div className="paper-panel-title"><div><span>跟单策略</span><h2>博主与执行设置</h2></div><ShieldCheck size={25} /></div>
               <SourcePicker sources={sourceOptions} selectedSources={selectedSources} disabled={saving || account.lifecycle === 'stopped'} onToggle={toggleSource} />
               <div className="setting-row"><div><strong>{account.lifecycle === 'stopped' ? '本次模拟已结算' : account.auto_execute ? '已选博主新信号持续自动模拟' : '旧账户自动模拟未启用'}</strong><small>关闭应用不结算；重开继续处理新信号。市价信号按当前价模拟，区间信号等待入场。</small></div>{!account.auto_execute && account.lifecycle !== 'stopped' && <button onClick={async () => { try { setAccount(await setPaperAutoExecute(true)); } catch (err) { setError(err.message); } }}>启用持续跟单</button>}</div>
-              <div className="setting-values"><span>杠杆<strong>{account.leverage}x</strong></span><span>模拟手续费<strong>{money(Number(account.fee_rate) * 100, 3)}%</strong></span><span>已付手续费<strong>{money(account.fees_paid)}</strong></span></div>
+              <div className="setting-values"><span>杠杆<strong>按币种自动选择</strong></span><span>模拟手续费<strong>{money(Number(account.fee_rate) * 100, 3)}%</strong></span><span>已付手续费<strong>{money(account.fees_paid)}</strong></span></div>
               <p className="performance-note">运行中不可重置本金或覆盖 ID。停止结算后，可创建新的独立模拟。</p>
             </article>
           </section>
@@ -269,7 +269,7 @@ export function PaperAccountView() {
                   <td><span className={`trade-status ${trade.status}`}>{statusLabels[trade.status]}</span>{trade.close_reason ? <small>{trade.close_reason}</small> : null}</td>
                   <td><strong>{trade.entry_price ? money(trade.entry_price) : `${money(trade.entry_low)} – ${money(trade.entry_high)}`}</strong><small>实盘 {trade.last_price ? money(trade.last_price) : "等待行情"}</small></td>
                   <td><strong>{trade.remaining_size ?? "—"}</strong><small>保证金 {money(trade.margin)}</small></td>
-                  <td><strong className="loss">SL {money(trade.stop_loss)}</strong><small>{nextTarget ? `TP${trade.next_take_profit + 1} ${money(nextTarget)}` : "止盈完成"}</small></td>
+                  <td><strong className="loss">SL {money(trade.stop_loss)}</strong><small>{trade.awaiting_protection && trade.status === 'open' ? `等待保护回复 · 截止 ${new Date(trade.protection_deadline).toLocaleTimeString()}` : nextTarget ? `TP${trade.next_take_profit + 1} ${money(nextTarget)}` : trade.status === 'closed' ? '已结束' : '暂无止盈'}</small>{trade.take_profits.length === 3 && <small>初始数量 40% / 40% / 20%</small>}</td>
                   <td><strong className={totalPnl >= 0 ? "profit" : "loss"}>{signedMoney(totalPnl)}</strong><small>手续费 {money(trade.fees)}</small></td>
                 </tr>;
               })}</tbody></table></div> : <div className="paper-empty"><ChartLineUp size={34} /><strong>还没有模拟订单</strong><span>加入最新信号，或开启新信号自动模拟。</span></div>}

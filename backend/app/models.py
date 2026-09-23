@@ -39,12 +39,14 @@ class ParsedSignal(BaseModel):
     source_message_id: int | None = None
     raw_text: str
     market_entry: bool = False
+    awaiting_protection: bool = False
+    entry_correction: dict | None = None
     symbol: str
     side: SignalSide
     entry_low: Decimal
     entry_high: Decimal
     stop_loss: Decimal
-    take_profits: list[Decimal] = Field(min_length=1)
+    take_profits: list[Decimal]
     risk_percent: Decimal | None = None
     confidence: float = Field(ge=0, le=1)
     status: SignalStatus = SignalStatus.PENDING_REVIEW
@@ -61,6 +63,14 @@ class ParsedSignal(BaseModel):
 
     @model_validator(mode="after")
     def validate_trade_geometry(self) -> "ParsedSignal":
+        if self.awaiting_protection:
+            if not self.market_entry or self.take_profits or self.stop_loss != 0:
+                raise ValueError('等待保护的市价意图不能伪造止盈止损')
+            if not self.entry_low.is_finite() or self.entry_low <= 0 or self.entry_low != self.entry_high:
+                raise ValueError('市价开仓意图必须包含唯一有限正入场参考价')
+            return self
+        if not self.take_profits:
+            raise ValueError('完整信号必须有止盈')
         if self.stop_loss <= 0 or any(tp <= 0 for tp in self.take_profits):
             raise ValueError("stop loss and take profits must be positive")
         if self.entry_low <= 0 or self.entry_high <= 0:
@@ -321,6 +331,8 @@ class PaperTrade(BaseModel):
     stop_loss: Decimal
     take_profits: list[Decimal]
     next_take_profit: int = 0
+    awaiting_protection: bool = False
+    protection_deadline: datetime | None = None
     leverage: int
     risk_percent: Decimal
     margin: Decimal = Decimal("0")

@@ -58,6 +58,8 @@ class BitgetDemoClient:
         self.settings = settings
         self._candle_cache: dict[str, tuple[float, list[Decimal]]] = {}
         self._candle_limit = asyncio.Semaphore(3)
+        self._private_pace_lock = asyncio.Lock()
+        self._last_private_request = 0.0
         self._http = httpx.AsyncClient(
             base_url=settings.bitget_base_url,
             timeout=httpx.Timeout(10.0),
@@ -107,6 +109,11 @@ class BitgetDemoClient:
         params: dict[str, str] | None = None,
         payload: dict | None = None,
     ) -> dict:
+        # Share pacing across reconciliation, account reads and writes so a
+        # multi-position recovery cannot burst through private endpoint limits.
+        async with self._private_pace_lock:
+            await asyncio.sleep(max(0, .13-(time.monotonic()-self._last_private_request)))
+            self._last_private_request=time.monotonic()
         is_write = method.upper() != 'GET'
         query_string = urlencode(sorted((params or {}).items()))
         body = (

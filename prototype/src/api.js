@@ -18,6 +18,7 @@ export function getSystemStatus(signal) {
 }
 export const getAccountPerformance = signal => apiRequest('/api/account/performance', { signal });
 export const getUtaReadiness = () => apiRequest('/api/uta/readiness');
+export const utaRequest = (path, body) => apiRequest(`/api/uta/${path}`,body===undefined?{}:{method:'POST',body:JSON.stringify(body)});
 
 export const sendTelegramCode = () => apiRequest('/api/telegram/send-code', { method: 'POST' });
 export const signInTelegram = (body) => apiRequest('/api/telegram/sign-in', { method: 'POST', body: JSON.stringify(body) });
@@ -26,6 +27,7 @@ export const saveTelegramChannels = (chat_ids) => apiRequest('/api/telegram/chan
 export const getTelegramMessages = (signal) => apiRequest('/api/telegram/messages', { signal });
 export const getTelegramInbox = (chatId, signal) => apiRequest(`/api/telegram/inbox${chatId ? `?chat_id=${chatId}` : ''}`, { signal });
 export const syncTelegramHistory = (chatId) => apiRequest(`/api/telegram/channels/${chatId}/history`, { method: 'POST' });
+export const reparseTelegramCache = () => apiRequest('/api/telegram/reparse', { method: 'POST' });
 
 export function getMarketOverview(signal) {
   return apiRequest("/api/market/overview", { signal });
