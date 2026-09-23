@@ -132,13 +132,13 @@ export function ConnectionManagement({ onStatusChange }) {
         </div>
         <div className="connection-detail">{loading ? "正在读取配置…" : overview?.bitget?.detail}</div>
         <div className="environment-picker" role="group" aria-label="Bitget 环境">
-          <button type="button" className={bitget.environment === "live" ? "active" : ""} onClick={() => setBitget({ ...bitget, environment: "live" })}>实盘只读</button>
+          <button type="button" className={bitget.environment === "live" ? "active" : ""} onClick={() => setBitget({ ...bitget, environment: "live" })}>实盘 UTA</button>
           <button type="button" className={bitget.environment === "demo" ? "active" : ""} onClick={() => setBitget({ ...bitget, environment: "demo" })}>模拟盘</button>
         </div>
         <SecretInput label="API Key" value={bitget.api_key} onChange={(value) => setBitget({ ...bitget, api_key: value })} placeholder={overview?.bitget_api_key_hint || "输入 API Key"} help="留空将保留当前 API Key" />
         <SecretInput label="Secret Key" value={bitget.api_secret} onChange={(value) => setBitget({ ...bitget, api_secret: value })} placeholder={overview?.bitget?.configured ? "已安全保存，留空不修改" : "输入 Secret Key"} />
         <SecretInput label="Passphrase" value={bitget.passphrase} onChange={(value) => setBitget({ ...bitget, passphrase: value })} placeholder={overview?.bitget?.configured ? "已安全保存，留空不修改" : "输入 Passphrase"} />
-        <div className="security-note"><ShieldCheck weight="fill" /><span><strong>实盘安全保护</strong>实盘模式仅允许读取，程序会在网络请求前阻止真实下单。</span></div>
+        <div className="security-note"><ShieldCheck weight="fill" /><span><strong>实盘独立授权</strong>保存 API 不会开启交易。请到信号追踪设置资金限制并明确启用；跟单不需要提现权限。</span></div>
         {bitget.environment === 'demo' && <label className="demo-order-switch"><input type="checkbox" checked={bitget.enable_demo_orders} onChange={event => setBitget({ ...bitget, enable_demo_orders: event.target.checked })} />允许向 Bitget 模拟盘提交订单（另需在信号追踪开启自动执行）</label>}
         <button className="save-connection" disabled={saving === "bitget"}>{saving === "bitget" ? "正在验证…" : "验证并保存 Bitget"}</button>
       </form>

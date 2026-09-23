@@ -14,6 +14,7 @@ import {
 } from "./api";
 import "./signal-tracking.css";
 import { AccountPerformance } from './AccountPerformance';
+import { UtaExecution } from './UtaExecution';
 
 const defaultSettings = {
   enabled: false,
@@ -183,24 +184,25 @@ export function SignalTrackingView({ focusSignalId }) {
         <div>
           <div className="monitor-title-line">
             <h1>信号追踪</h1>
-            <button
+            {systemStatus?.bitget_environment === 'demo' && <button
               type="button"
               className={settings.enabled ? "automation-status enabled" : "automation-status"}
               aria-pressed={settings.enabled}
               onClick={() => updateSetting("enabled", !settings.enabled)}
             >
               <span />{settings.enabled ? "自动执行已启用" : "自动执行未启用"}
-            </button>
+            </button>}
           </div>
-          <p>信号源：Telegram · <strong>{sourceName}</strong><i />每 2 秒刷新 · {systemStatus?.bitget_environment === "demo" ? "Bitget 模拟盘" : "实盘只读"}</p>
+          <p>信号源：Telegram · <strong>{sourceName}</strong><i />每 2 秒刷新 · {systemStatus?.bitget_environment === "demo" ? "Bitget 模拟盘" : "UTA 实盘（需单独启用）"}</p>
         </div>
-        <button className="save-settings" type="button" onClick={saveSettings} disabled={saving}>
+        {systemStatus?.bitget_environment === 'demo' && <button className="save-settings" type="button" onClick={saveSettings} disabled={saving}>
           <GearSix size={17} />{saving ? "保存中…" : "保存设置"}
-        </button>
+        </button>}
       </header>
       <AccountPerformance />
+      {systemStatus?.bitget_environment !== 'demo' && <UtaExecution />}
 
-      <section className="execution-settings" aria-label="自动交易设置">
+      {systemStatus?.bitget_environment === 'demo' && <section className="execution-settings" aria-label="自动交易设置">
         <div className="source-setting">
           <span className="setting-label">信号源（{systemStatus?.telegram?.connected ? "已连接" : "未连接"}）</span>
           <div className="channel-row"><PaperPlaneTilt size={33} weight="fill" /><span><strong>{sourceName}</strong><small>Telegram 频道</small></span></div>
@@ -240,7 +242,7 @@ export function SignalTrackingView({ focusSignalId }) {
           <span className="number-input"><input type="number" min="1" max="150" step="1" value={settings.default_leverage} onChange={(event) => updateSetting("default_leverage", Math.min(150, Math.max(1, Number(event.target.value))))} /><b>x</b></span>
           <small>币种覆盖优先，超出上限自动下调</small>
         </label>
-      </section>
+      </section>}
 
       <div className="monitor-toolbar">
         <div className="signal-tabs" role="tablist" aria-label="信号状态">
@@ -257,7 +259,7 @@ export function SignalTrackingView({ focusSignalId }) {
       </div>
 
       {feedback ? <div className={feedback.includes("已保存") ? "monitor-feedback success" : "monitor-feedback"}>{feedback}</div> : null}
-      {settings.enabled && (!systemStatus?.demo_order_execution_enabled || !systemStatus?.bitget?.connected || !systemStatus?.telegram?.connected) ? <div className="monitor-feedback">尚未具备自动跟单条件：请在连接管理完成 Telegram 登录和频道选择、连接 Bitget 模拟盘，并允许提交模拟盘订单。</div> : null}
+      {systemStatus?.bitget_environment === 'demo' && settings.enabled && (!systemStatus?.demo_order_execution_enabled || !systemStatus?.bitget?.connected || !systemStatus?.telegram?.connected) ? <div className="monitor-feedback">尚未具备自动跟单条件：请在连接管理完成 Telegram 登录和频道选择、连接 Bitget 模拟盘，并允许提交模拟盘订单。</div> : null}
 
       <section className="signal-table" aria-label="自动信号列表" aria-busy={loading}>
         <div className="signal-row signal-head">
@@ -275,8 +277,8 @@ export function SignalTrackingView({ focusSignalId }) {
                 <span className="summary-cell">{signal.raw_text?.split("\n")[0]}</span>
                 <span className="parse-cell"><CheckCircle weight="fill" />解析成功</span>
                 <span><b className={submitted ? "executed-tag" : "waiting-tag"}>{statusLabel[signal.status] || signal.status}</b></span>
-                <span>{settings.sizing_mode === "fixed_usdt" ? `${settings.fixed_usdt} USDT` : `${settings.position_percent}%`}</span>
-                <span>{leverageFor(signal.symbol)}x</span>
+                <span>{systemStatus?.bitget_environment !== 'demo' ? '详见实盘记录' : settings.sizing_mode === "fixed_usdt" ? `${settings.fixed_usdt} USDT` : `${settings.position_percent}%`}</span>
+                <span>{systemStatus?.bitget_environment !== 'demo' ? '详见实盘记录' : `${leverageFor(signal.symbol)}x`}</span>
                 <span>{signal.execution_at ? new Date(signal.execution_at).toLocaleTimeString() : "—"}</span>
               </button>
               {expanded ? <SignalDetail signal={signal} settings={settings} effectiveLeverage={leverageFor(signal.symbol)} /> : null}

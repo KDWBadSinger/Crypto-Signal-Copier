@@ -49,7 +49,7 @@ export function Dashboard() {
         </nav>
         <div className="account">
           <span className="avatar">U</span>
-          <span><strong>本机工作区</strong><small>桌面预览版 · 模拟盘</small></span>
+          <span><strong>本机工作区</strong><small>个人桌面版 · 本地运行</small></span>
           <CaretDown size={15} />
         </div>
       </aside>

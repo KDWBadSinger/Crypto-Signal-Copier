@@ -38,6 +38,7 @@ from .telegram_client import TelegramSignalClient
 from .market_feed import PublicMarketFeed
 from .licensing import LicenseClient
 from .account_curve import AccountCurve
+from .uta_runtime import UtaRuntime
 
 
 DEMO_SIGNAL = """ETHUSDT SHORT
@@ -55,6 +56,7 @@ class CopierService:
         self.account_curve = AccountCurve(self.store)
         self.license = LicenseClient(self.store)
         self.bitget = BitgetDemoClient(settings)
+        self.uta_runtime = UtaRuntime(self.bitget,self.store)
         self.paper = PaperTradingStore(settings.database_path)
         self._message_subscribers: set[asyncio.Queue] = set()
         self.telegram = TelegramSignalClient(settings, self.ingest_signal, self.record_telegram_message, self.store.get_message, self.manage_telegram_position)
@@ -91,6 +93,7 @@ class CopierService:
         )
 
     async def start(self) -> None:
+        await self.uta_runtime.start()
         self.paper.runtime_start()
         await self.market_feed.start()
         self.bitget_connected, self.bitget_detail = await self.bitget.healthcheck()
@@ -108,6 +111,7 @@ class CopierService:
         await self.telegram.start()
 
     async def stop(self) -> None:
+        await self.uta_runtime.stop()
         await self.market_feed.stop()
         if self._paper_monitor_task:
             self._paper_monitor_task.cancel()
@@ -139,6 +143,17 @@ class CopierService:
                 await self.paper_execute(signal)
             except (PaperTradingError, BitgetError) as exc:
                 self.store.add_audit(signal.id, "paper_execution_failed", str(exc))
+        if inserted and not self.settings.bitget_is_demo:
+            try:
+                if signal.source_chat_id not in self.settings.telegram_allowed_chat_ids:
+                    raise BitgetError('仅执行已选择 Telegram 频道的实时信号')
+                override=next((item for item in self._leverage_overrides.items if item.symbol==signal.symbol),None)
+                requested=override.leverage if override else self.uta_runtime.limits().max_leverage
+                await self.uta_runtime.ingest(signal,requested)
+                self.store.add_audit(signal.id,'uta_execution','实盘开单已进入持久化交易所核对流程')
+            except (ValueError,BitgetError) as exc:
+                self.store.add_audit(signal.id,'auto_execution_blocked',str(exc))
+            return
         if not inserted or self.manual_review_enabled:
             return
         if not self.settings.bitget_is_demo:
@@ -201,6 +216,18 @@ class CopierService:
 
     async def manage_telegram_position(self, message):
         command = message['management']
+        live_result=None
+        if self.uta_runtime.management_authorized:
+            try:
+                if command.get('ambiguous') or message.get('origin')!='live' or message['chat_id'] not in self.settings.telegram_allowed_chat_ids:
+                    raise BitgetError('仅处理已监听频道的实时明确管理指令')
+                if message.get('reply_to_chat_id',message['chat_id'])!=message['chat_id']:
+                    raise BitgetError('不执行跨频道回复指令')
+                parent=self.store.get_message(message['chat_id'],message['reply_to_message_id']) if message.get('reply_to_message_id') else None
+                sid,detail=await self.uta_runtime.manage(message,parent.get('signal_id') if parent else None)
+                live_result={'status':'managed','signal_id':sid,'detail':'UTA 实盘：'+detail}
+            except (ValueError,BitgetError,OSError) as exc:
+                live_result={'status':'management_rejected','detail':'UTA 实盘管理等待核对：'+str(exc)}
         try:
             if command['ambiguous']:
                 raise PaperTradingError('管理消息含多个币种、否定或条件表述，不自动执行')
@@ -220,6 +247,8 @@ class CopierService:
             self.store.add_audit(target['signal_id'], 'paper_management', message['detail'])
         except (PaperTradingError, BitgetError, OSError) as exc:
             message.update(status='management_rejected', detail=f'管理指令未执行：{exc}；交易所管理操作未启用')
+        if live_result:
+            message.update(live_result)
 
     async def refresh_paper_market(self, symbols: list[str] | None = None) -> None:
         async with self._paper_lock:
@@ -346,6 +375,8 @@ class CopierService:
     async def configure_bitget(
         self, request: BitgetConnectionRequest
     ) -> ConnectionOverview:
+        if self.uta_runtime.enabled or any(r['state'] not in {'closed','rejected'} for r in self.uta_runtime.engine.all()):
+            raise BitgetError('请先停止新开仓并完成现有实盘仓位结算，再更换 API，避免遗失仓位管理')
         api_key = request.api_key.get_secret_value().strip() if request.api_key else self.settings.bitget_api_key
         api_secret = request.api_secret.get_secret_value().strip() if request.api_secret else self.settings.bitget_api_secret
         passphrase = request.passphrase.get_secret_value().strip() if request.passphrase else self.settings.bitget_api_passphrase
@@ -382,10 +413,15 @@ class CopierService:
             }
         )
         old_client = self.bitget
+        desktop_authorized=self.uta_runtime.host_authorized
+        await self.uta_runtime.stop()
         old_stream = self.bitget_stream
         await old_stream.stop()
         self.settings = candidate
         self.bitget = new_client
+        self.uta_runtime = UtaRuntime(self.bitget,self.store)
+        self.uta_runtime.host_authorized=desktop_authorized
+        await self.uta_runtime.start()
         self.bitget_stream = BitgetPrivateStream(
             candidate, self._on_bitget_stream_event, self._on_bitget_stream_state
         )

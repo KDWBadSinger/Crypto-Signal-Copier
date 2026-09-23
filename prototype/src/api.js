@@ -18,6 +18,7 @@ export function getSystemStatus(signal) {
 }
 export const getAccountPerformance = signal => apiRequest('/api/account/performance', { signal });
 export const getUtaReadiness = () => apiRequest('/api/uta/readiness');
+export const utaRequest = (path, body) => apiRequest(`/api/uta/${path}`,body===undefined?{}:{method:'POST',body:JSON.stringify(body)});
 
 export const sendTelegramCode = () => apiRequest('/api/telegram/send-code', { method: 'POST' });
 export const signInTelegram = (body) => apiRequest('/api/telegram/sign-in', { method: 'POST', body: JSON.stringify(body) });

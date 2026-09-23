@@ -39,6 +39,7 @@ from .models import PaperSizingRequest
 from .service import CopierService
 from .release import VERSION, database_export
 from .uta import UtaReadiness
+from .uta_risk import UtaRiskLimits
 
 settings = load_settings()
 service = CopierService(settings)
@@ -75,6 +76,50 @@ async def uta_readiness():
         raise HTTPException(status_code=409,detail=str(exc)) from exc
 
 
+@app.get('/api/uta/execution')
+async def uta_execution_status():
+    return service.uta_runtime.status()
+
+
+@app.post('/api/uta/risk')
+async def uta_execution_risk(request:UtaRiskLimits):
+    return service.uta_runtime.configure(request)
+
+
+class UtaActivation(BaseModel):
+    confirmation: str
+
+
+@app.post('/api/uta/activate')
+async def uta_activate(request:UtaActivation):
+    try:
+        if not service.telegram.connected or not service.settings.telegram_allowed_chat_ids:
+            raise BitgetError('请先登录 Telegram 并选择监听频道')
+        await service.license.allow_new_order()
+        return await service.uta_runtime.activate(request.confirmation)
+    except (ValueError,BitgetError) as exc:
+        raise HTTPException(409,str(exc)) from exc
+
+
+@app.post('/api/uta/pause')
+async def uta_pause():
+    return service.uta_runtime.pause()
+
+
+@app.post('/api/uta/reconcile')
+async def uta_reconcile():
+    try:
+        service.uta_runtime._authorize_write()
+        return await service.uta_runtime.reconcile()
+    except BitgetError as exc:
+        raise HTTPException(409,str(exc)) from exc
+
+
+@app.get('/api/uta/performance')
+async def uta_performance():
+    return service.uta_runtime.performance()
+
+
 @app.exception_handler(RequestValidationError)
 async def invalid_request(_, exc):
     # Pydantic's default errors can include plaintext credential input.
@@ -97,7 +142,7 @@ async def diagnostics():
             'market': {'connected': service.market_feed.connected, 'detail': service.market_feed.detail,
                        'reconnects': service.market_feed.reconnects, 'rejected_ticks': service.market_feed.rejected_ticks},
             'tasks': {'market': task_state(service.market_feed.task), 'paper': task_state(service._paper_monitor_task)},
-            'paper_lifecycle': paper.lifecycle, 'real_money_execution': False,
+            'paper_lifecycle': paper.lifecycle, 'real_money_execution': service.uta_runtime.enabled,
             'commercial_status': 'release_candidate_requires_live_acceptance'}
 
 
