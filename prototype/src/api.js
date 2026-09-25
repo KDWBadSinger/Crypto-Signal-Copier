@@ -33,6 +33,8 @@ export function getMarketOverview(signal) {
   return apiRequest("/api/market/overview", { signal });
 }
 
+export const getMarketQuery = (symbol, signal) => apiRequest(`/api/market/query?symbol=${encodeURIComponent(symbol)}`, { signal });
+
 export function setManualReview(enabled) {
   return apiRequest("/api/settings/manual-review", {
     method: "POST",
@@ -55,10 +57,10 @@ export function getLeverageOverrides(signal) {
   return apiRequest("/api/settings/leverage-overrides", { signal });
 }
 
-export function saveLeverageOverrides(items) {
+export function saveLeverageOverrides(items, defaultMaxPercent) {
   return apiRequest("/api/settings/leverage-overrides", {
     method: "POST",
-    body: JSON.stringify({ items }),
+    body: JSON.stringify({ items, default_max_percent: defaultMaxPercent }),
   });
 }
 
@@ -94,6 +96,18 @@ export function getLatestSignal(signal) {
 
 export function getSignals(limit = 20, signal) {
   return apiRequest(`/api/signals?limit=${limit}`, { signal });
+}
+
+export function closePaperPositions(positionId) {
+  return apiRequest('/api/paper/close-positions', {method:'POST', body:JSON.stringify({position_id:positionId,confirmation:'确认模拟平仓'})});
+}
+
+export function getTakeProfitAllocation(signal) {
+  return apiRequest('/api/settings/take-profit-allocation', { signal });
+}
+
+export function saveTakeProfitAllocation(percentages) {
+  return apiRequest('/api/settings/take-profit-allocation', { method: 'POST', body: JSON.stringify({ percentages }) });
 }
 
 export const getSignal = (id, signal) => apiRequest(`/api/signals/${encodeURIComponent(id)}`, { signal });

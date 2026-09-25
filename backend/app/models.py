@@ -149,6 +149,7 @@ class LeverageOverride(BaseModel):
 
 
 class LeverageOverrides(BaseModel):
+    default_max_percent: int = Field(default=50, ge=0, le=100, strict=True)
     items: list[LeverageOverride] = Field(default_factory=list, max_length=100)
 
     @model_validator(mode="after")
@@ -317,6 +318,7 @@ class PaperStrategyRequest(BaseModel):
 
 
 class PaperTrade(BaseModel):
+    tp_percentages: list[int] = Field(default_factory=lambda: [40,40,20])
     id: str
     signal_id: str
     symbol: str

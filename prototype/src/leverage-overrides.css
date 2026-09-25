@@ -1,4 +1,13 @@
 .leverage-page { min-height: 100vh; padding: 28px; color: #1d2633; background: #fff; }
+.leverage-percent { margin-top: 16px; padding: 20px 22px; border: 1px solid #dfe5ed; border-radius: 8px; }
+.leverage-percent label { display: flex; justify-content: space-between; font-size: 14px; }
+.leverage-percent label strong { color: var(--blue); font-size: 22px; }
+.leverage-percent input { width: 100%; margin: 18px 0 8px; accent-color: var(--blue); }
+.percent-scale { display: flex; justify-content: space-between; color: #738095; font-size: 11px; }
+.leverage-percent p { margin: 16px 0; color: #5f6c7f; font-size: 12px; }
+.leverage-percent button { border: 0; border-radius: 5px; padding: 10px 18px; color: white; background: var(--blue); }
+.leverage-percent button:disabled { opacity: .5; cursor: not-allowed; }
+.leverage-percent > span { color: #9a6700; font-size: 12px; }
 .leverage-header { display: flex; align-items: flex-start; justify-content: space-between; gap: 24px; }
 .leverage-header h1 { font-size: 28px; letter-spacing: -.025em; }
 .leverage-header p { margin-top: 10px; color: #778295; font-size: 12px; }

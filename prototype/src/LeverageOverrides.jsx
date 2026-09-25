@@ -7,6 +7,7 @@ import {
   saveLeverageOverrides,
 } from "./api";
 import "./leverage-overrides.css";
+import { TakeProfitAllocation } from './TakeProfitAllocation';
 
 function normalizeSymbol(value) {
   const normalized = value.trim().toUpperCase().replaceAll("/", "").replaceAll("-", "");
@@ -14,7 +15,9 @@ function normalizeSymbol(value) {
 }
 
 export function LeverageOverridesView() {
-  const [defaultLeverage, setDefaultLeverage] = useState(10);
+  const [percent, setPercent] = useState(50);
+  const [savedPercent, setSavedPercent] = useState(50);
+  const [loaded, setLoaded] = useState(false);
   const [items, setItems] = useState([]);
   const [symbol, setSymbol] = useState("");
   const [leverage, setLeverage] = useState("10");
@@ -28,7 +31,9 @@ export function LeverageOverridesView() {
       getAutoExecutionSettings(controller.signal),
       getLeverageOverrides(controller.signal),
     ]).then(([settings, overrides]) => {
-      setDefaultLeverage(settings.default_leverage);
+      setPercent(overrides.default_max_percent);
+      setSavedPercent(overrides.default_max_percent);
+      setLoaded(true);
       setLeverage(String(settings.default_leverage));
       setItems(overrides.items);
     }).catch((error) => {
@@ -39,12 +44,13 @@ export function LeverageOverridesView() {
 
   const itemMap = useMemo(() => new Map(items.map((item) => [item.symbol, item])), [items]);
 
-  const persist = async (nextItems, successMessage) => {
+  const persist = async (nextItems, successMessage, nextPercent = savedPercent) => {
     setSaving(true);
     setFeedback("");
     try {
-      const saved = await saveLeverageOverrides(nextItems);
+      const saved = await saveLeverageOverrides(nextItems, nextPercent);
       setItems(saved.items);
+      setSavedPercent(saved.default_max_percent);
       setFeedback(successMessage);
     } catch (error) {
       setFeedback(error.message);
@@ -75,19 +81,28 @@ export function LeverageOverridesView() {
   return (
     <div className="leverage-page">
       <header className="leverage-header">
-        <div><h1>币种杠杆覆盖</h1><p>为特定 USDT 永续合约设置独立杠杆；未配置币种采用交易所实时最大杠杆的 50%，向下取整。</p></div>
+        <div><h1>币种杠杆覆盖</h1><p>单币种配置优先；未配置币种按保存的默认比例计算新单杠杆，向下取整。</p></div>
         <div className="margin-mode"><CheckCircle weight="fill" /><span><small>保证金模式</small><strong>全仓</strong></span></div>
       </header>
 
       <section className="leverage-summary">
-        <div><Gauge size={28} /><span><small>未配置币种默认规则</small><strong>最大杠杆 × 50%</strong></span></div>
-        <p>例如交易所最大 100x → 默认 50x，125x → 62x。单币种配置优先，超出交易所限制时下调。原 30x 及全局上限不再应用；读取限制失败则拒单。适用于本地模拟及交易所自动跟单。</p>
+        <div><Gauge size={28} /><span><small>未配置币种默认规则 · 已保存</small><strong>最大杠杆 × {savedPercent}%</strong></span></div>
+        <p>适用于本地模拟及交易所自动跟单，仅影响新单，不修改已有仓位。0% 暂停未配置币种的新开仓；计算结果低于交易所最小杠杆或读取限制失败时拒单，不自动提高杠杆。</p>
+      </section>
+      <section className="leverage-percent">
+        <label htmlFor="default-leverage-percent">默认最大杠杆比例 <strong>{percent}%</strong></label>
+        <input id="default-leverage-percent" type="range" min="0" max="100" step="1" value={percent} disabled={!loaded || saving} onChange={event => setPercent(Number(event.target.value))} />
+        <div className="percent-scale"><span>0% · 暂停新开仓</span><span>50%</span><span>100% · 最大杠杆</span></div>
+        <p>{percent === 0 ? '未配置币种不再新开仓；已有仓位保护和单币种覆盖继续生效。' : `预览：交易所最大 100x → ${percent}x；最大 125x → ${Math.floor(125 * percent / 100)}x。`}</p>
+        <button disabled={!loaded || saving || percent === savedPercent} onClick={() => persist(items, '默认杠杆比例已保存，仅对新单生效', percent)}>{saving ? '保存中…' : '保存默认比例'}</button>
+        {percent !== savedPercent && <span> 尚未保存</span>}
       </section>
 
+      <TakeProfitAllocation />
       <form className="override-form" onSubmit={addOverride}>
         <label><span>交易对</span><div><input value={symbol} onChange={(event) => setSymbol(event.target.value)} placeholder="例如 BTC 或 BTCUSDT" /><b>USDT 永续</b></div></label>
         <label><span>目标杠杆</span><div><input type="number" min="1" max="150" value={leverage} onChange={(event) => setLeverage(event.target.value)} /><b>x</b></div></label>
-        <button type="submit" disabled={saving || !symbol.trim()}><Plus />添加覆盖</button>
+        <button type="submit" disabled={!loaded || saving || !symbol.trim()}><Plus />添加覆盖</button>
       </form>
 
       {feedback ? <div className={feedback.includes("已保存") || feedback.includes("已删除") ? "override-feedback success" : "override-feedback"}>{feedback}</div> : null}
@@ -105,7 +120,7 @@ export function LeverageOverridesView() {
             <button type="button" aria-label={`删除 ${item.symbol} 覆盖`} disabled={saving} onClick={() => persist(items.filter((entry) => entry.symbol !== item.symbol), `${item.symbol} 杠杆覆盖已删除`)}><Trash /></button>
           </div>;
         })}
-        {itemMap.size === 0 ? <div className="override-empty"><Gauge size={30} /><strong>还没有单币种覆盖</strong><span>所有交易对按各自交易所最大杠杆的 50% 自动计算</span></div> : null}
+        {itemMap.size === 0 ? <div className="override-empty"><Gauge size={30} /><strong>还没有单币种覆盖</strong><span>所有交易对按已保存的 {savedPercent}% 默认比例处理</span></div> : null}
       </section>
     </div>
   );
