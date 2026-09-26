@@ -103,6 +103,8 @@ class PaperTradingStore:
             trade_columns = {r['name'] for r in connection.execute('PRAGMA table_info(paper_trades)')}
             if 'market_entry' not in trade_columns:
                 connection.execute("ALTER TABLE paper_trades ADD COLUMN market_entry INTEGER NOT NULL DEFAULT 0")
+            if 'tp_percentages' not in trade_columns:
+                connection.execute("ALTER TABLE paper_trades ADD COLUMN tp_percentages TEXT NOT NULL DEFAULT '[40,40,20]'")
             for name, declaration in {'source_chat_id': 'INTEGER', 'source_message_id': 'INTEGER',
                                       'management_flags': "TEXT NOT NULL DEFAULT '[]'",
                                       'sizing_mode': "TEXT NOT NULL DEFAULT 'risk'",
@@ -178,6 +180,31 @@ class PaperTradingStore:
                 self._record_day(connection, now.isoformat())
             elif error:
                 connection.execute("UPDATE paper_account SET market_error=? WHERE id=1", (error,))
+
+    def pause_entries_for_close_all(self):
+        with self._lock, self._connect() as connection:
+            connection.execute('UPDATE paper_account SET auto_execute=0 WHERE id=1')
+            connection.execute("UPDATE paper_trades SET status='rejected', close_reason='manual_close_all_cancelled_pending', updated_at=? WHERE status='pending'", (datetime.now(UTC).isoformat(),))
+
+    def close_positions(self, prices, trade_id=None):
+        """Close only this local ledger, atomically; no exchange writes."""
+        from .follow_policy import positive
+        now = datetime.now(UTC).isoformat()
+        with self._lock, self._connect() as connection:
+            if trade_id is None:
+                connection.execute('UPDATE paper_account SET auto_execute=0 WHERE id=1')
+                connection.execute("UPDATE paper_trades SET status='rejected', close_reason='manual_close_all_cancelled_pending', updated_at=? WHERE status='pending'", (now,))
+            rows=connection.execute("SELECT * FROM paper_trades WHERE status='open'").fetchall()
+            if trade_id is not None:
+                exists=connection.execute('SELECT id FROM paper_trades WHERE id=?',(trade_id,)).fetchone()
+                if not exists: raise PaperTradingError('模拟订单不存在')
+                rows=[r for r in rows if r['id']==trade_id]
+            for row in rows:
+                price=positive(prices[row['symbol']])
+                self._close_size(connection,row,price,Decimal(row['remaining_size']),
+                                 'manual_close_all' if trade_id is None else 'manual_close',now)
+            self._record_day(connection,now)
+            return self._snapshot(connection)
 
     def runtime_stop(self) -> None:
         self.heartbeat()
@@ -287,7 +314,9 @@ class PaperTradingStore:
             if cursor.rowcount != 1:
                 raise PaperTradingError("请先初始化程序内模拟账户")
 
-    def enqueue(self, signal: ParsedSignal, *, leverage=None) -> bool:
+    def enqueue(self, signal: ParsedSignal, *, leverage=None, tp_percentages=None) -> bool:
+        from .follow_policy import validate_tp_percentages
+        allocation = validate_tp_percentages(tp_percentages if tp_percentages is not None else [40,40,20])
         if not self.is_initialized():
             raise PaperTradingError("请先初始化程序内模拟账户")
         now = datetime.now(UTC).isoformat()
@@ -318,6 +347,7 @@ class PaperTradingStore:
                 ),
             )
             connection.execute("UPDATE paper_trades SET market_entry=? WHERE signal_id=?", (int(signal.market_entry), signal.id))
+            connection.execute('UPDATE paper_trades SET tp_percentages=? WHERE signal_id=?', (json.dumps(allocation), signal.id))
             connection.execute('UPDATE paper_trades SET awaiting_protection=?, entry_deviation=? WHERE signal_id=?',
                                (int(signal.awaiting_protection),'0.10' if signal.entry_correction else '0.02',signal.id))
             connection.execute('UPDATE paper_trades SET source_chat_id=?, source_message_id=? WHERE signal_id=?',
@@ -382,10 +412,10 @@ class PaperTradingStore:
                 details.append(f'保留指令执行前剩余仓位的 10%；500% 保证金毛收益目标价 {target}；保留止损')
             elif 'tp1' in actions and 'tp1' not in flags and row['next_take_profit'] == 0:
                 count = len(json.loads(row['take_profits']))
-                first=target_sizes(Decimal(row['size']),count,MONEY)[0]
+                first=target_sizes(Decimal(row['size']),count,MONEY,json.loads(row['tp_percentages']))[0]
                 self._close_size(connection, row, price, min(Decimal(row['remaining_size']),first), 'manual_tp1', now, next_take_profit=1)
                 flags.add('tp1')
-                details.append(f'按实时价格 {price} 执行第一档止盈（三档按初始数量 40%/40%/20%，其他档数等分）')
+                details.append(f'按实时价格 {price} 执行第一档止盈（三档按开仓时保存比例 {row["tp_percentages"]}，其他档数等分）')
             connection.execute('UPDATE paper_trades SET management_flags=? WHERE id=?', (json.dumps(sorted(flags)), trade_id))
             detail = '；'.join(details) or '该减仓阶段已完成，不重复执行'
             connection.execute('INSERT INTO paper_commands VALUES (?, ?, ?, ?)', (account['simulation_id'], chat_id, message_id, detail))
@@ -508,11 +538,16 @@ class PaperTradingStore:
         next_index = int(row["next_take_profit"])
         remaining = Decimal(row["remaining_size"])
         while next_index < len(targets):
+            allocation = target_sizes(Decimal(row['size']),len(targets),MONEY,json.loads(row['tp_percentages']))
+            if allocation[next_index] == 0:
+                next_index += 1
+                connection.execute('UPDATE paper_trades SET next_take_profit=? WHERE id=?', (next_index,row['id']))
+                continue
             hit = price >= targets[next_index] if side == SignalSide.LONG.value else price <= targets[next_index]
             if not hit:
                 break
             targets_left = len(targets) - next_index
-            close_size = remaining if targets_left == 1 else min(remaining,target_sizes(Decimal(row['size']),len(targets),MONEY)[next_index])
+            close_size = min(remaining,allocation[next_index])
             row = self._close_size(
                 connection, row, price, close_size, f"take_profit_{next_index + 1}", now,
                 next_take_profit=next_index + 1,
@@ -618,6 +653,7 @@ class PaperTradingStore:
             entry_price=entry, last_price=last, size=Decimal(row["size"]) if row["size"] else None,
             remaining_size=remaining, stop_loss=Decimal(row["stop_loss"]),
             take_profits=[Decimal(x) for x in json.loads(row["take_profits"])],
+            tp_percentages=json.loads(row['tp_percentages']),
             next_take_profit=int(row["next_take_profit"]), leverage=int(row["leverage"]),
             awaiting_protection=bool(row['awaiting_protection']),protection_deadline=row['protection_deadline'],
             risk_percent=Decimal(row["risk_percent"]), margin=margin, unrealized_pnl=unrealized,

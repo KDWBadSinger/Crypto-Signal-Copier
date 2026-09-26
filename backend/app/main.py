@@ -115,6 +115,31 @@ async def uta_reconcile():
         raise HTTPException(409,str(exc)) from exc
 
 
+class ManualCloseRequest(BaseModel):
+    position_id: str | None = Field(default=None, max_length=128)
+    confirmation: str
+
+
+@app.post('/api/uta/close-positions')
+async def close_uta_positions(request: ManualCloseRequest):
+    if request.confirmation != '确认实盘平仓':
+        raise HTTPException(400,'请明确确认实盘平仓')
+    try:
+        return await service.uta_runtime.close_positions(request.position_id)
+    except (ValueError,BitgetError) as exc:
+        raise HTTPException(409,str(exc)) from exc
+
+
+@app.post('/api/paper/close-positions', response_model=PaperAccount)
+async def close_paper_positions(request: ManualCloseRequest):
+    if request.confirmation != '确认模拟平仓':
+        raise HTTPException(400,'请明确确认模拟平仓')
+    try:
+        return await service.close_paper_positions(request.position_id)
+    except (ValueError,KeyError,BitgetError,PaperTradingError,OSError) as exc:
+        raise HTTPException(409,str(exc)) from exc
+
+
 @app.get('/api/uta/performance')
 async def uta_performance():
     return service.uta_runtime.performance()
@@ -279,6 +304,19 @@ async def get_market_overview() -> MarketOverview:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
 
 
+@app.get('/api/market/query')
+async def get_market_query(symbol: str = Query(min_length=1, max_length=32)):
+    from .market_query import query_market
+    try:
+        return await query_market(service.bitget, symbol)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except BitgetError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+
 @app.get("/api/connections", response_model=ConnectionOverview)
 async def get_connections() -> ConnectionOverview:
     return await service.connection_overview()
@@ -347,6 +385,27 @@ async def set_auto_execution_settings(
     request: AutoExecutionSettingsRequest,
 ) -> AutoExecutionSettings:
     return service.set_auto_execution_settings(request)
+
+
+class TakeProfitAllocation(BaseModel):
+    percentages: list[int] = Field(min_length=3, max_length=3)
+
+
+@app.get('/api/settings/take-profit-allocation')
+async def get_take_profit_allocation():
+    return {'percentages': service.tp_percentages()}
+
+
+@app.post('/api/settings/take-profit-allocation')
+async def save_take_profit_allocation(request: TakeProfitAllocation):
+    from .follow_policy import validate_tp_percentages
+    import json
+    try:
+        values = validate_tp_percentages(request.percentages)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    service.store.set_setting('tp_percentages', json.dumps(values))
+    return {'percentages': values}
 
 
 @app.get("/api/settings/leverage-overrides", response_model=LeverageOverrides)

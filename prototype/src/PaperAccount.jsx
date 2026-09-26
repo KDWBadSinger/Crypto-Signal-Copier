@@ -1,4 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import { ClosePositionDialog } from "./ClosePositionDialog";
+import { closePaperPositions } from "./api";
 import {
   ArrowsClockwise, ChartLineUp, CheckCircle, Clock, Coins, Play,
   ShieldCheck, TrendDown, TrendUp, UsersThree, Wallet, Warning,
@@ -28,6 +30,19 @@ const money = (value, digits = 2) => Number(value || 0).toLocaleString("en-US", 
   minimumFractionDigits: digits,
   maximumFractionDigits: digits,
 });
+
+const price = (value) => {
+  if (value === null || value === undefined || value === "") return "—";
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) return String(value);
+  const absolute = Math.abs(numeric);
+  const maximumFractionDigits = absolute >= 1000 ? 2 : absolute >= 1 ? 4 : 8;
+  return numeric.toLocaleString("en-US", {
+    minimumFractionDigits: 0,
+    maximumFractionDigits,
+    useGrouping: absolute >= 1000,
+  });
+};
 
 const signedMoney = (value) => {
   const numeric = Number(value || 0);
@@ -63,6 +78,9 @@ function SourcePicker({ sources, selectedSources, disabled, onToggle }) {
 
 export function PaperAccountView() {
   const [account, setAccount] = useState(null);
+  const [closeTarget,setCloseTarget]=useState(null);
+  const [closeBusy,setCloseBusy]=useState(false);
+  const closePositions=async()=>{setCloseBusy(true);setError("");try{setAccount(await closePaperPositions(closeTarget.all?null:closeTarget.id));}catch(e){setError(e.message);}finally{setCloseBusy(false);setCloseTarget(null);}};
   const [latestSignal, setLatestSignal] = useState(null);
   const [sourceOptions, setSourceOptions] = useState([]);
   const [selectedSources, setSelectedSources] = useState([]);
@@ -198,7 +216,7 @@ export function PaperAccountView() {
 
       {error ? <div className="api-error paper-error"><Warning weight="fill" />{error}</div> : null}
       {account?.market_error && <div className="api-error paper-error">{account.market_error}</div>}
-      {account?.initialized && <section className="paper-run-banner"><div><strong>{account.simulation_id}</strong><span>{account.lifecycle === 'stopped' ? '已停止 · 结算已保存' : '持续跟单 · 重启自动恢复'}</span><small>累计在线 {duration(account.active_seconds)} · 最近有效行情 {account.market_updated_at ? new Date(account.market_updated_at).toLocaleString('zh-CN') : '尚无记录'}</small></div>{account.lifecycle === 'stopped' ? <button onClick={() => { setCreating(!creating); setSimulationId(''); }}>{creating ? '返回结算' : '创建新的模拟 ID'}</button> : <button className="paper-stop" disabled={saving} onClick={() => setConfirmStop(true)}>{saving ? '处理中…' : '停止跟单并结算'}</button>}</section>}
+      {account?.initialized && <section className="paper-run-banner"><div><strong>{account.simulation_id}</strong><span>{account.lifecycle === 'stopped' ? '已停止 · 结算已保存' : account.auto_execute ? '持续跟单 · 重启自动恢复' : '新开仓已暂停 · 模拟 ID 保留'}</span><small>累计在线 {duration(account.active_seconds)} · 最近有效行情 {account.market_updated_at ? new Date(account.market_updated_at).toLocaleString('zh-CN') : '尚无记录'}</small></div>{account.lifecycle === 'stopped' ? <button onClick={() => { setCreating(!creating); setSimulationId(''); }}>{creating ? '返回结算' : '创建新的模拟 ID'}</button> : <button className="paper-stop" disabled={saving} onClick={() => setConfirmStop(true)}>{saving ? '处理中…' : '停止跟单并结算'}</button>}</section>}
       {confirmStop && <section className="paper-stop-confirm" role="alertdialog" aria-label="确认停止模拟"><h2>停止并结算 {account?.simulation_id}？</h2><p>按最新公开行情平掉模拟持仓（计入手续费），取消未成交订单。该 ID 结算后不再继续，报告将保留。行情不可用时不强行结算，可恢复网络后重试。</p><button disabled={saving} onClick={toggleAutoExecute}>{saving ? '正在结算…' : '确认停止并结算'}</button><button disabled={saving} onClick={() => setConfirmStop(false)}>继续跟单</button></section>}
 
       {account?.lifecycle === 'stopped' && <PaperPerformance revision={`${account.simulation_id}:${account.updated_at}`} />}
@@ -209,7 +227,7 @@ export function PaperAccountView() {
           <label>定仓方式<select value={sizingMode} onChange={e => setSizingMode(e.target.value)}><option value="fixed_usdt">每单固定保证金</option><option value="position_percent">账户权益百分比保证金</option><option value="risk">按信号风险与止损距离</option></select></label>
           {sizingMode === 'fixed_usdt' && <label>每单保证金（USDT）<input type="number" min="0.01" step="0.01" value={fixedUsdt} onChange={e => setFixedUsdt(e.target.value)} /></label>}
           {sizingMode === 'position_percent' && <label>每单权益比例（%，最多 10）<input type="number" min="0.01" max="10" step="0.1" value={positionPercent} onChange={e => setPositionPercent(e.target.value)} /></label>}
-          <div>新单杠杆：币种杠杆页配置优先；未配置采用交易所最大杠杆的 50%，不再使用旧全局倍数。</div>
+          <div>新单杠杆：单币种配置优先；未配置采用“币种杠杆”页保存的最大杠杆比例，0% 暂停未配置币种新开仓。</div>
           {account?.initialized && !creating && <button disabled={saving || loading} onClick={async () => { setSaving(true); setError(''); try { setAccount(await savePaperSizing(sizing)); } catch(e) { setError(e.message); } finally { setSaving(false); } }}>保存新单设置</button>}
         </div>
         <p>{sizingMode === 'risk' ? '完整信号按止损距离定仓；市价先开仓时将权益 × 风险比例作为保证金。风险比例缺省为 1%。' : sizingMode === 'fixed_usdt' ? `每单保证金 ${fixedUsdt} USDT，名义持仓 = 保证金 × 该币种实际杠杆；另扣开仓手续费。` : '以成交时权益计算保证金；余额不足则拒绝开仓，不擅自缩小订单。'}</p>
@@ -242,7 +260,7 @@ export function PaperAccountView() {
                 {latestSignal ? <span className={`direction ${latestSignal.side}`}>{latestSignal.side === "long" ? <TrendUp /> : <TrendDown />}{latestSignal.side === "long" ? "做多" : "做空"}</span> : null}
               </div>
               {latestSignal ? <>
-                <div className="signal-price-grid"><div><span>入场区间</span><strong>{money(latestSignal.entry_low)} – {money(latestSignal.entry_high)}</strong></div><div><span>止损</span><strong>{money(latestSignal.stop_loss)}</strong></div><div><span>风险</span><strong>{latestSignal.risk_percent || 1}%</strong></div></div>
+                <div className="signal-price-grid"><div><span>入场区间</span><strong>{price(latestSignal.entry_low)} – {price(latestSignal.entry_high)}</strong></div><div><span>止损</span><strong>{price(latestSignal.stop_loss)}</strong></div><div><span>风险</span><strong>{latestSignal.risk_percent || 1}%</strong></div></div>
                 <button className="paper-primary" disabled={saving || latestAlreadyAdded || account.lifecycle === 'stopped'} onClick={executeLatest}>
                   {latestAlreadyAdded ? <><CheckCircle weight="fill" />已加入模拟账户</> : <><Play weight="fill" />使用实盘行情模拟</>}
                 </button>
@@ -252,25 +270,25 @@ export function PaperAccountView() {
             <article className="paper-panel paper-settings">
               <div className="paper-panel-title"><div><span>跟单策略</span><h2>博主与执行设置</h2></div><ShieldCheck size={25} /></div>
               <SourcePicker sources={sourceOptions} selectedSources={selectedSources} disabled={saving || account.lifecycle === 'stopped'} onToggle={toggleSource} />
-              <div className="setting-row"><div><strong>{account.lifecycle === 'stopped' ? '本次模拟已结算' : account.auto_execute ? '已选博主新信号持续自动模拟' : '旧账户自动模拟未启用'}</strong><small>关闭应用不结算；重开继续处理新信号。市价信号按当前价模拟，区间信号等待入场。</small></div>{!account.auto_execute && account.lifecycle !== 'stopped' && <button onClick={async () => { try { setAccount(await setPaperAutoExecute(true)); } catch (err) { setError(err.message); } }}>启用持续跟单</button>}</div>
+              <div className="setting-row"><div><strong>{account.lifecycle === 'stopped' ? '本次模拟已结算' : account.auto_execute ? '已选博主新信号持续自动模拟' : '新开仓已暂停'}</strong><small>关闭应用不结算，但会暂停 Telegram 接收与行情监控；离线期间的信号不会在重开后追补交易。市价信号按当前价模拟，区间信号等待入场。</small></div>{!account.auto_execute && account.lifecycle !== 'stopped' && <button onClick={async () => { try { setAccount(await setPaperAutoExecute(true)); } catch (err) { setError(err.message); } }}>启用持续跟单</button>}</div>
               <div className="setting-values"><span>杠杆<strong>按币种自动选择</strong></span><span>模拟手续费<strong>{money(Number(account.fee_rate) * 100, 3)}%</strong></span><span>已付手续费<strong>{money(account.fees_paid)}</strong></span></div>
               <p className="performance-note">运行中不可重置本金或覆盖 ID。停止结算后，可创建新的独立模拟。</p>
             </article>
           </section>
 
           <section className="paper-panel paper-trades">
-            <div className="paper-panel-title"><div><span>本地账本</span><h2>模拟订单与持仓</h2></div><small><Clock />每 5 秒刷新实盘标记价</small></div>
-            {account.trades.length ? <div className="paper-table-wrap"><table><thead><tr><th>币种 / 方向</th><th>状态</th><th>入场 / 实盘价</th><th>数量 / 保证金</th><th>止损 / 下一止盈</th><th>盈亏</th></tr></thead>
+            <div className="paper-panel-title"><div><span>本地账本</span><h2>模拟订单与持仓</h2></div><button className="position-close" disabled={closeBusy||!account.trades.some(t=>["open","pending"].includes(t.status))} onClick={()=>setCloseTarget({all:true})}>全部平仓</button><small><Clock />每 5 秒刷新实盘标记价</small></div>
+            {closeTarget&&<ClosePositionDialog target={closeTarget} busy={closeBusy} onCancel={()=>setCloseTarget(null)} onConfirm={closePositions}/>}
+            {account.trades.length ? <div className="paper-table-wrap"><table><thead><tr><th>币种 / 方向</th><th>状态</th><th>成交 / 参考 / 行情</th><th>数量 / 保证金</th><th>止损 / 全部止盈</th><th>盈亏</th><th>操作</th></tr></thead>
               <tbody>{account.trades.map((trade) => {
                 const totalPnl = Number(trade.realized_pnl) + Number(trade.unrealized_pnl) - Number(trade.fees);
-                const nextTarget = trade.take_profits[trade.next_take_profit];
                 return <tr key={trade.id}>
                   <td><strong>{trade.symbol}</strong><span className={`direction compact ${trade.side}`}>{trade.side === "long" ? "多" : "空"}</span><small>{new Date(trade.created_at).toLocaleString("zh-CN", { hour12: false })}</small></td>
-                  <td><span className={`trade-status ${trade.status}`}>{statusLabels[trade.status]}</span>{trade.close_reason ? <small>{trade.close_reason}</small> : null}</td>
-                  <td><strong>{trade.entry_price ? money(trade.entry_price) : `${money(trade.entry_low)} – ${money(trade.entry_high)}`}</strong><small>实盘 {trade.last_price ? money(trade.last_price) : "等待行情"}</small></td>
+                  <td><span className={`trade-status ${trade.status}`}>{statusLabels[trade.status]}</span>{trade.close_reason ? <small>{{manual_close:'手动平仓',manual_close_all:'全部平仓',manual_close_all_cancelled_pending:'全部平仓时撤销待入场'}[trade.close_reason] || trade.close_reason}</small> : null}</td>
+                  <td><strong>{trade.entry_price ? price(trade.entry_price) : `${price(trade.entry_low)} – ${price(trade.entry_high)}`}</strong><small>博主参考 {price(trade.entry_low)} · 行情 {trade.last_price ? price(trade.last_price) : "等待行情"}</small></td>
                   <td><strong>{trade.remaining_size ?? "—"}</strong><small>保证金 {money(trade.margin)}</small></td>
-                  <td><strong className="loss">SL {money(trade.stop_loss)}</strong><small>{trade.awaiting_protection && trade.status === 'open' ? `等待保护回复 · 截止 ${new Date(trade.protection_deadline).toLocaleTimeString()}` : nextTarget ? `TP${trade.next_take_profit + 1} ${money(nextTarget)}` : trade.status === 'closed' ? '已结束' : '暂无止盈'}</small>{trade.take_profits.length === 3 && <small>初始数量 40% / 40% / 20%</small>}</td>
-                  <td><strong className={totalPnl >= 0 ? "profit" : "loss"}>{signedMoney(totalPnl)}</strong><small>手续费 {money(trade.fees)}</small></td>
+                  <td><strong className="loss">SL {price(trade.stop_loss)}</strong>{trade.awaiting_protection && trade.status === 'open' ? <small>等待保护回复 · 截止 {new Date(trade.protection_deadline).toLocaleTimeString()}</small> : trade.take_profits.length ? <>{trade.take_profits.map((target, index) => <small key={`${trade.id}-tp-${index}`}><b>{index === trade.next_take_profit && trade.status === 'open' ? '下一档 · ' : ''}TP{index + 1}</b> {price(target)}{trade.take_profits.length === 3 ? ` · ${(trade.tp_percentages || [40,40,20])[index]}% 初始数量` : ''}{trade.take_profits.length === 3 && (trade.tp_percentages || [40,40,20])[index] === 0 ? ' · 已禁用' : index < trade.next_take_profit ? ' · 已触发' : ''}</small>)}</> : <small>{trade.status === 'closed' ? '已结束' : '暂无止盈'}</small>}</td>
+                  <td><strong className={totalPnl >= 0 ? "profit" : "loss"}>{signedMoney(totalPnl)}</strong><small>手续费 {money(trade.fees)}</small></td><td>{trade.status==="open"&&<button className="position-close" disabled={closeBusy} onClick={()=>setCloseTarget({id:trade.id,symbol:trade.symbol})}>手动平仓</button>}</td>
                 </tr>;
               })}</tbody></table></div> : <div className="paper-empty"><ChartLineUp size={34} /><strong>还没有模拟订单</strong><span>加入最新信号，或开启新信号自动模拟。</span></div>}
           </section>

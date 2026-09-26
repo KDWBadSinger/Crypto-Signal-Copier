@@ -139,7 +139,7 @@ export function SignalTrackingView({ focusSignalId }) {
     () => new Map(leverageOverrides.map((item) => [item.symbol, item.leverage])),
     [leverageOverrides],
   );
-  const leverageFor = (symbol) => leverageBySymbol.has(symbol) ? `${leverageBySymbol.get(symbol)}x 配置值` : '实时最大 × 50%';
+  const leverageFor = (symbol) => leverageBySymbol.has(symbol) ? `${leverageBySymbol.get(symbol)}x 配置值` : '按已保存的最大杠杆比例';
   const activeCount = rows.filter((item) => item.status === "submitted").length;
   const visibleRows = rows.filter((item) => {
     if (signalFilter === "executed") return item.status === "submitted";
@@ -239,7 +239,7 @@ export function SignalTrackingView({ focusSignalId }) {
 
         <label className="leverage-setting">
           <span className="setting-label">默认杠杆 · 全仓</span>
-          <strong>交易所最大杠杆 × 50%</strong>
+          <strong>交易所最大杠杆 × 币种杠杆页配置比例</strong>
           <small>向下取整；币种覆盖优先，不使用旧全局上限</small>
         </label>
       </section>}

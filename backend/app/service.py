@@ -89,7 +89,7 @@ class CopierService:
         )
         stored_overrides = self.store.get_setting("leverage_overrides") or "[]"
         self._leverage_overrides = LeverageOverrides.model_validate(
-            {"items": json.loads(stored_overrides)}
+            {"items": json.loads(stored_overrides), "default_max_percent": int(self.store.get_setting('leverage_default_max_percent') or '50')}
         )
 
     async def start(self) -> None:
@@ -184,7 +184,7 @@ class CopierService:
                 return
         if inserted and self.paper.is_initialized() and self.paper.should_auto_execute(signal.source_name):
             try:
-                await self.paper_execute(signal)
+                await self.paper_execute(signal, automatic=True)
             except (PaperTradingError, BitgetError, ValueError) as exc:
                 self.store.add_audit(signal.id, "paper_execution_failed", str(exc))
         if inserted and not self.settings.bitget_is_demo:
@@ -193,7 +193,7 @@ class CopierService:
                     raise BitgetError('仅执行已选择 Telegram 频道的实时信号')
                 override=next((item for item in self._leverage_overrides.items if item.symbol==signal.symbol),None)
                 requested=override.leverage if override else None
-                await self.uta_runtime.ingest(signal,requested)
+                await self.uta_runtime.ingest(signal,requested,default_max_percent=self._leverage_overrides.default_max_percent,tp_percentages=self.tp_percentages())
                 self.store.add_audit(signal.id,'uta_execution','实盘开单已进入持久化交易所核对流程')
             except (ValueError,BitgetError) as exc:
                 self.store.add_audit(signal.id,'auto_execution_blocked',str(exc))
@@ -225,7 +225,7 @@ class CopierService:
             override=next((item for item in self._leverage_overrides.items if item.symbol==signal.symbol),None)
             requested_leverage = override.leverage if override else None
             minimum_leverage, maximum_leverage = await self.bitget.symbol_leverage_limits(signal.symbol)
-            effective_leverage = exchange_leverage(maximum_leverage,minimum_leverage,requested_leverage)
+            effective_leverage = exchange_leverage(maximum_leverage,minimum_leverage,requested_leverage,self._leverage_overrides.default_max_percent)
             order_size = await self._resolve_auto_order_size(signal, effective_leverage)
             await self.bitget.set_cross_leverage(signal.symbol, effective_leverage)
             self.store.add_audit(
@@ -250,20 +250,22 @@ class CopierService:
             if latest.status not in {SignalStatus.UNKNOWN, SignalStatus.SUBMITTING}:
                 self.store.update_status(signal, SignalStatus.REJECTED, detail=str(exc))
 
-    async def paper_execute(self, signal: ParsedSignal) -> None:
+    async def paper_execute(self, signal: ParsedSignal, *, automatic=False) -> None:
         await self.license.allow_new_order()
         minimum,maximum=await self.bitget.symbol_leverage_limits(signal.symbol)
         from .follow_policy import exchange_leverage
         override=next((item for item in self._leverage_overrides.items if item.symbol==signal.symbol),None)
-        effective=exchange_leverage(maximum,minimum,override.leverage if override else None)
+        effective=exchange_leverage(maximum,minimum,override.leverage if override else None,self._leverage_overrides.default_max_percent)
         async with self._paper_lock:
-            inserted = self.paper.enqueue(signal,leverage=effective)
+            if automatic and not self.paper.snapshot().auto_execute:
+                raise PaperTradingError('模拟自动跟单已暂停，不再新开仓')
+            inserted = self.paper.enqueue(signal,leverage=effective,tp_percentages=self.tp_percentages())
         if not inserted:
             raise PaperTradingError("该信号已经加入程序内模拟账户")
         self.store.add_audit(
             signal.id,
             "paper_order_created",
-            f"使用 Bitget 实盘行情；不会向交易所提交订单。交易所最大杠杆 {maximum}x，实际 {effective}x（{'单币种配置' if override else '最大杠杆 50%，向下取整'}）",
+            f"使用 Bitget 实盘行情；不会向交易所提交订单。交易所最大杠杆 {maximum}x，实际 {effective}x；默认比例 {self._leverage_overrides.default_max_percent}%，单币种配置优先",
         )
         await self.refresh_paper_market([signal.symbol])
 
@@ -317,6 +319,18 @@ class CopierService:
             except (BitgetError, OSError, PaperTradingError) as exc:
                 self.paper.heartbeat(error="公开行情暂不可用，保留上次估值；恢复连接后继续")
                 raise
+
+    async def close_paper_positions(self, trade_id=None):
+        async with self._paper_lock:
+            account=self.paper.snapshot()
+            if not account.initialized: raise PaperTradingError('请先初始化模拟账户')
+            if trade_id is None:
+                self.paper.pause_entries_for_close_all()
+            symbols={t.symbol for t in account.trades if t.status=='open' and (trade_id is None or t.id==trade_id)}
+            prices={symbol:await self.public_price(symbol) for symbol in symbols}
+            result=self.paper.close_positions(prices,trade_id)
+            self.store.add_audit(None,'paper_manual_close',f'模拟平仓：{trade_id or "全部持仓并暂停新开仓"}')
+            return result
 
     async def stop_paper(self) -> PaperAccount:
         async with self._paper_lock:
@@ -840,7 +854,12 @@ class CopierService:
     def leverage_overrides(self) -> LeverageOverrides:
         return self._leverage_overrides
 
+    def tp_percentages(self):
+        from .follow_policy import validate_tp_percentages
+        return validate_tp_percentages(json.loads(self.store.get_setting('tp_percentages') or '[40,40,20]'))
+
     def set_leverage_overrides(self, request: LeverageOverrides) -> LeverageOverrides:
+        self.store.set_setting('leverage_default_max_percent', str(request.default_max_percent))
         self._leverage_overrides = request
         self.store.set_setting(
             "leverage_overrides",
