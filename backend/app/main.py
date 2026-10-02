@@ -86,6 +86,17 @@ async def uta_execution_risk(request:UtaRiskLimits):
     return service.uta_runtime.configure(request)
 
 
+class UtaSources(BaseModel):
+    chat_ids: list[int]
+
+
+@app.post('/api/uta/sources')
+async def uta_sources(request: UtaSources):
+    if not set(request.chat_ids).issubset(set(service.settings.telegram_allowed_chat_ids)):
+        raise HTTPException(status_code=400, detail='只能选择已监听的 Telegram 频道')
+    return service.uta_runtime.set_sources(request.chat_ids)
+
+
 class UtaActivation(BaseModel):
     confirmation: str
 
@@ -143,6 +154,24 @@ async def close_paper_positions(request: ManualCloseRequest):
 @app.get('/api/uta/performance')
 async def uta_performance():
     return service.uta_runtime.performance()
+
+
+@app.get('/api/paper/orders/{trade_id}/history')
+async def paper_order_history(trade_id: str):
+    try:
+        return service.paper.order_detail(trade_id)
+    except PaperTradingError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.get('/api/uta/orders/{signal_id}/history')
+async def uta_order_history(signal_id: str):
+    row = next((r for r in service.uta_runtime.engine.all() if r['signal_id'] == signal_id), None)
+    if row is None:
+        raise HTTPException(status_code=404, detail='实盘订单不存在')
+    payload = row['payload']
+    return {'signal': payload.get('entry_signal', payload.get('signal', {})),
+            'events': payload.get('order_events', []), 'legacy': 'entry_signal' not in payload}
 
 
 @app.exception_handler(RequestValidationError)

@@ -347,6 +347,11 @@ class TelegramSignalClient:
             self.on_message(message)
         try:
             signal = await self.inspect_message(message)
+            if signal:
+                from .order_history import message_evidence
+                parent = self.has_message(message['chat_id'], message['reply_to_message_id']) if self.has_message and message.get('reply_to_message_id') else None
+                signal.source_messages = [message_evidence(m) for m in ([parent, message] if parent else [message])]
+                message['parsed_signal'] = signal.model_dump(mode='json')
             sent_at = getattr(event.message, "date", None)
             if edited:
                 message["detail"] = "消息已编辑，仅更新原文和解析预览；不会重新下单。" + message.get("detail", "")

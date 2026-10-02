@@ -297,7 +297,7 @@ class CopierService:
                 target = self.paper.management_target(message['chat_id'], command['symbol'],
                                                        None if signal_id else root_id, signal_id)
                 price = await self.public_price(target['symbol'])
-                detail = self.paper.manage(message['chat_id'], message['message_id'], target['id'], command['actions'], price)
+                detail = self.paper.manage(message['chat_id'], message['message_id'], target['id'], command['actions'], price, message=message)
             message.update(status='managed', signal_id=target['signal_id'], detail='程序内模拟：'+detail+'。未向 Bitget 交易所发送管理操作。')
             self.store.add_audit(target['signal_id'], 'paper_management', message['detail'])
         except (PaperTradingError, BitgetError, OSError) as exc:

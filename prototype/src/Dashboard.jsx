@@ -1,7 +1,7 @@
 import { useState } from "react";
 import {
   Bell, CaretDown, ChartLineUp, Coins, Database, FileText, Gauge, Gear, Link,
-  ListChecks, TelegramLogo, Wallet,
+  ListChecks, TelegramLogo, Wallet, Flask,
 } from "@phosphor-icons/react";
 import "./dashboard.css";
 import { SignalTrackingView } from "./SignalTracking";
@@ -11,15 +11,17 @@ import { BitgetAccountView } from "./BitgetAccount";
 import { LeverageOverridesView } from "./LeverageOverrides";
 import { MarketOverview } from "./MarketOverview";
 import { TelegramInbox } from './TelegramInbox';
+import { UtaExecution } from './UtaExecution';
 
 const navItems = [
   { id: "market", icon: ChartLineUp, label: "市场行情" },
-  { id: "signals", icon: TelegramLogo, label: "信号追踪" },
   { id: "telegram", icon: TelegramLogo, label: "Telegram 消息" },
+  { id: "signals", icon: FileText, label: "信号追踪" },
   { id: "leverage", icon: Gauge, label: "币种杠杆" },
-  { id: "paper", icon: Wallet, label: "实盘模拟" },
+  { id: "live", icon: Wallet, label: "实盘操作" },
+  { id: "paper", icon: Flask, label: "跟单模拟" },
   { id: "account", icon: Coins, label: "资金管理" },
-  { id: "connections", icon: Link, label: "连接管理" },
+  { id: "connections", icon: Link, label: "链接管理" },
 ];
 
 export function Dashboard() {
@@ -60,9 +62,10 @@ export function Dashboard() {
         {activeNav === "telegram" ? <TelegramInbox onManage={() => setActiveNav('connections')} onViewSignal={id => { setFocusedSignal(id); setActiveNav('signals'); }} /> : null}
         {activeNav === "leverage" ? <LeverageOverridesView /> : null}
         {activeNav === "paper" ? <PaperAccountView /> : null}
+        {activeNav === "live" ? <UtaExecution onManage={() => setActiveNav('connections')} /> : null}
         {activeNav === "account" ? <BitgetAccountView /> : null}
         {activeNav === "connections" ? <ConnectionManagement /> : null}
-        {!new Set(["market", "signals", "telegram", "leverage", "paper", "account", "connections"]).has(activeNav) ? (
+        {!new Set(["market", "signals", "telegram", "leverage", "live", "paper", "account", "connections"]).has(activeNav) ? (
           <div className="empty-module" aria-label={`${activeItem.label}页面`} />
         ) : null}
       </main>

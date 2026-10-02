@@ -1,4 +1,4 @@
-VERSION = '0.4.6-local'
+VERSION = '0.4.7-local'
 from contextlib import closing
 
 

@@ -13,8 +13,6 @@ import {
   saveAutoExecutionSettings,
 } from "./api";
 import "./signal-tracking.css";
-import { AccountPerformance } from './AccountPerformance';
-import { UtaExecution } from './UtaExecution';
 
 const defaultSettings = {
   enabled: false,
@@ -199,8 +197,6 @@ export function SignalTrackingView({ focusSignalId }) {
           <GearSix size={17} />{saving ? "保存中…" : "保存设置"}
         </button>}
       </header>
-      <AccountPerformance />
-      {systemStatus?.bitget_environment !== 'demo' && <UtaExecution />}
 
       {systemStatus?.bitget_environment === 'demo' && <section className="execution-settings" aria-label="自动交易设置">
         <div className="source-setting">

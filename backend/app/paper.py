@@ -8,6 +8,7 @@ from decimal import Decimal, ROUND_DOWN
 from pathlib import Path
 from .database import ManagedConnection
 from .follow_policy import target_sizes, temporary_stop, PROTECTION_WAIT_SECONDS
+from .order_history import event, signal_evidence, message_evidence
 
 from .models import (
     PaperAccount,
@@ -106,6 +107,11 @@ class PaperTradingStore:
             if 'tp_percentages' not in trade_columns:
                 connection.execute("ALTER TABLE paper_trades ADD COLUMN tp_percentages TEXT NOT NULL DEFAULT '[40,40,20]'")
             for name, declaration in {'source_chat_id': 'INTEGER', 'source_message_id': 'INTEGER',
+                                      'signal_snapshot': "TEXT NOT NULL DEFAULT '{}'",
+                                      'order_events': "TEXT NOT NULL DEFAULT '[]'",
+                                      'protection_sources': "TEXT NOT NULL DEFAULT '[]'",
+                                      'stop_sources': "TEXT NOT NULL DEFAULT '[]'",
+                                      'target_sources': "TEXT NOT NULL DEFAULT '[]'",
                                       'management_flags': "TEXT NOT NULL DEFAULT '[]'",
                                       'sizing_mode': "TEXT NOT NULL DEFAULT 'risk'",
                                       'sizing_value': "TEXT NOT NULL DEFAULT '0'",
@@ -184,7 +190,12 @@ class PaperTradingStore:
     def pause_entries_for_close_all(self):
         with self._lock, self._connect() as connection:
             connection.execute('UPDATE paper_account SET auto_execute=0 WHERE id=1')
-            connection.execute("UPDATE paper_trades SET status='rejected', close_reason='manual_close_all_cancelled_pending', updated_at=? WHERE status='pending'", (datetime.now(UTC).isoformat(),))
+            self._cancel_pending(connection, datetime.now(UTC).isoformat())
+
+    def _cancel_pending(self, connection, now):
+        for row in connection.execute("SELECT id FROM paper_trades WHERE status='pending'").fetchall():
+            connection.execute("UPDATE paper_trades SET status='rejected', close_reason='manual_close_all_cancelled_pending', updated_at=? WHERE id=?", (now, row['id']))
+            self._event(connection, row['id'], 'cancelled', '用户全部平仓：撤销尚未成交的入场订单', actor='user', at=now)
 
     def close_positions(self, prices, trade_id=None):
         """Close only this local ledger, atomically; no exchange writes."""
@@ -193,7 +204,7 @@ class PaperTradingStore:
         with self._lock, self._connect() as connection:
             if trade_id is None:
                 connection.execute('UPDATE paper_account SET auto_execute=0 WHERE id=1')
-                connection.execute("UPDATE paper_trades SET status='rejected', close_reason='manual_close_all_cancelled_pending', updated_at=? WHERE status='pending'", (now,))
+                self._cancel_pending(connection, now)
             rows=connection.execute("SELECT * FROM paper_trades WHERE status='open'").fetchall()
             if trade_id is not None:
                 exists=connection.execute('SELECT id FROM paper_trades WHERE id=?',(trade_id,)).fetchone()
@@ -234,7 +245,9 @@ class PaperTradingStore:
                     previous = None
                 points.append(point or {"day": day.isoformat(), "equity": None, "balance": None, "profit": None, "daily_profit": None})
                 day += timedelta(days=1)
-        return {"account": account.model_dump(mode="json"), "daily": points, "timezone": "UTC"}
+        history = {r['id']: {'signal': json.loads(r['signal_snapshot']), 'events': json.loads(r['order_events'])}
+                   for r in connection.execute('SELECT id,signal_snapshot,order_events FROM paper_trades')}
+        return {"account": account.model_dump(mode="json"), "daily": points, "timezone": "UTC", 'order_history': history}
 
     def report(self, simulation_id: str | None = None) -> dict:
         with self._connect() as connection:
@@ -354,7 +367,32 @@ class PaperTradingStore:
                                (signal.source_chat_id, signal.source_message_id, signal.id))
             connection.execute('UPDATE paper_trades SET sizing_mode=?, sizing_value=? WHERE signal_id=?',
                                (account['sizing_mode'], account['fixed_usdt'] if account['sizing_mode'] == 'fixed_usdt' else account['position_percent'], signal.id))
+            sources = signal_evidence(signal)
+            connection.execute('UPDATE paper_trades SET signal_snapshot=?, protection_sources=? WHERE signal_id=?',
+                               (signal.model_dump_json(), json.dumps(sources), signal.id))
+            connection.execute('UPDATE paper_trades SET stop_sources=?, target_sources=? WHERE signal_id=?', (json.dumps(sources), json.dumps(sources), signal.id))
+            self._event(connection, f'paper_{signal.id}', 'entry_pending', '收到开仓信号，等待符合入场条件的行情', sources=sources, actor='signal', at=now)
         return True
+
+    def _event(self, connection, trade_id, action, detail, *, sources=None, actor='system', at=None, values=None):
+        row = connection.execute('SELECT order_events FROM paper_trades WHERE id=?', (trade_id,)).fetchone()
+        events = json.loads(row['order_events'])
+        events.append(event(action, detail, sources=sources, actor=actor, at=at, values=values))
+        connection.execute('UPDATE paper_trades SET order_events=? WHERE id=?',
+                           (json.dumps(events, ensure_ascii=False), trade_id))
+
+    def order_detail(self, trade_id):
+        with self._connect() as connection:
+            row = connection.execute('SELECT * FROM paper_trades WHERE id=?', (trade_id,)).fetchone()
+            signal = json.loads(row['signal_snapshot']) if row else {}
+            legacy = not bool(signal)
+            if row and legacy and connection.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='signals'").fetchone():
+                saved = connection.execute('SELECT payload FROM signals WHERE id=?', (row['signal_id'],)).fetchone()
+                if saved:
+                    signal = json.loads(saved['payload'])
+        if row is None:
+            raise PaperTradingError('模拟订单不存在')
+        return {'signal': signal, 'events': json.loads(row['order_events']), 'legacy': legacy}
 
     def management_target(self, chat_id, symbol=None, root_id=None, signal_id=None):
         with self._connect() as connection:
@@ -366,7 +404,7 @@ class PaperTradingStore:
                 raise PaperTradingError('未找到唯一的同频道持仓，不猜测管理对象（可能未开仓、已平仓或存在多单）')
             return dict(rows[0])
 
-    def manage(self, chat_id, message_id, trade_id, actions, price):
+    def manage(self, chat_id, message_id, trade_id, actions, price, *, message=None):
         """Atomic, restart-safe paper-only management; caller supplies a fresh price."""
         if not price.is_finite() or price <= 0:
             raise PaperTradingError('管理指令需要有效实时价格')
@@ -390,6 +428,7 @@ class PaperTradingStore:
             if (long and price <= stop) or (not long and price >= stop):
                 raise PaperTradingError('当前价格已触发原止损，不覆盖止损规则')
             details = []
+            sources = [message_evidence(message)] if message else [{'chat_id': chat_id, 'message_id': message_id}]
             # A combined TP1 + runner message reduces once to the agreed runner size.
             if 'breakeven' in actions:
                 cost = entry * (1+fee)/(1-fee) if long else entry*(1-fee)/(1+fee)
@@ -398,6 +437,9 @@ class PaperTradingStore:
                 cost = max(cost, stop) if long else min(cost, stop)
                 connection.execute('UPDATE paper_trades SET stop_loss=?, updated_at=? WHERE id=?', (str(cost), now, trade_id))
                 details.append(f'含双边手续费成本损 {cost:.8f}（只收紧，不放宽）')
+                connection.execute('UPDATE paper_trades SET stop_sources=? WHERE id=?', (json.dumps(sources), trade_id))
+                self._event(connection, trade_id, 'stop_adjusted', f'移动止损线至 {cost:.8f}', sources=sources, actor='signal', at=now,
+                            values={'before': str(stop), 'stop_loss': str(cost)})
             if 'runner' in actions and 'runner' not in flags:
                 target = entry*(1+Decimal(5)/row['leverage']) if long else entry*(1-Decimal(5)/row['leverage'])
                 if target <= 0:
@@ -406,14 +448,16 @@ class PaperTradingStore:
                 keep = (remaining*Decimal('0.1')).quantize(MONEY, rounding=ROUND_DOWN)
                 if keep <= MONEY:
                     raise PaperTradingError('尾仓数量过小，未执行减仓')
-                self._close_size(connection, row, price, remaining-keep, 'runner_reduction', now)
+                self._close_size(connection, row, price, remaining-keep, 'runner_reduction', now, sources=sources)
                 connection.execute('UPDATE paper_trades SET take_profits=?, next_take_profit=0 WHERE id=?', (json.dumps([str(target)]), trade_id))
                 flags.update(['runner', 'tp1'])
                 details.append(f'保留指令执行前剩余仓位的 10%；500% 保证金毛收益目标价 {target}；保留止损')
+                self._event(connection, trade_id, 'targets_adjusted', f'尾仓止盈调整至 {target}', sources=sources, actor='signal', at=now)
+                connection.execute('UPDATE paper_trades SET target_sources=? WHERE id=?', (json.dumps(sources), trade_id))
             elif 'tp1' in actions and 'tp1' not in flags and row['next_take_profit'] == 0:
                 count = len(json.loads(row['take_profits']))
                 first=target_sizes(Decimal(row['size']),count,MONEY,json.loads(row['tp_percentages']))[0]
-                self._close_size(connection, row, price, min(Decimal(row['remaining_size']),first), 'manual_tp1', now, next_take_profit=1)
+                self._close_size(connection, row, price, min(Decimal(row['remaining_size']),first), 'manual_tp1', now, next_take_profit=1, sources=sources)
                 flags.add('tp1')
                 details.append(f'按实时价格 {price} 执行第一档止盈（三档按开仓时保存比例 {row["tp_percentages"]}，其他档数等分）')
             connection.execute('UPDATE paper_trades SET management_flags=? WHERE id=?', (json.dumps(sorted(flags)), trade_id))
@@ -516,12 +560,16 @@ class PaperTradingStore:
             """,
             (str(price), str(size), str(size), str(price), str(opening_fee), now, now, row["id"]),
         )
+        self._event(connection, row['id'], 'opened', f'模拟开仓成交：价格 {price}，数量 {size}，杠杆 {row["leverage"]}x',
+                    sources=signal_evidence(json.loads(row['signal_snapshot'])), actor='signal', at=now,
+                    values={'price': str(price), 'size': str(size), 'leverage': row['leverage']})
 
     def _reject(self, connection, trade_id: str, reason: str, now: str) -> None:
         connection.execute(
             "UPDATE paper_trades SET status='rejected', close_reason=?, closed_at=?, updated_at=? WHERE id=?",
             (reason, now, now, trade_id),
         )
+        self._event(connection, trade_id, 'rejected', reason, at=now)
 
     def _apply_exit_rules(self, connection, row, price: Decimal, now: str) -> None:
         if row['awaiting_protection'] and datetime.fromisoformat(now)>=datetime.fromisoformat(row['protection_deadline']):
@@ -571,11 +619,18 @@ class PaperTradingStore:
             ParsedSignal.model_validate({**signal.model_dump(),'entry_low':price,'entry_high':price})
             connection.execute('UPDATE paper_trades SET stop_loss=?,take_profits=?,awaiting_protection=0,updated_at=? WHERE id=?',
                                (str(signal.stop_loss),json.dumps([str(t) for t in signal.take_profits]),now,row['id']))
+            sources = signal_evidence(signal)
+            connection.execute('UPDATE paper_trades SET protection_sources=? WHERE id=?', (json.dumps(sources), row['id']))
+            connection.execute('UPDATE paper_trades SET stop_sources=?, target_sources=? WHERE id=?', (json.dumps(sources), json.dumps(sources), row['id']))
+            self._event(connection, row['id'], 'protection_updated',
+                        f'更新止损至 {signal.stop_loss}；止盈 '+ ' / '.join(str(t) for t in signal.take_profits),
+                        sources=sources, actor='signal', at=now,
+                        values={'stop_loss': str(signal.stop_loss), 'take_profits': [str(t) for t in signal.take_profits]})
             return True
 
     def _close_size(
         self, connection, row, price: Decimal, close_size: Decimal, reason: str,
-        now: str, next_take_profit: int | None = None,
+        now: str, next_take_profit: int | None = None, sources=None,
     ) -> sqlite3.Row:
         entry = Decimal(row["entry_price"])
         remaining = max(Decimal(row["remaining_size"]) - close_size, ZERO)
@@ -595,6 +650,17 @@ class PaperTradingStore:
                 now if closed else None, now, row["id"],
             ),
         )
+        manual = reason in {'manual_close', 'manual_close_all', 'simulation_stopped'}
+        reasons = {'stop_loss': '行情触发止损', 'protection_timeout': '等待保护回复超时',
+                   'manual_close': '用户手动平仓', 'manual_close_all': '用户全部平仓',
+                   'simulation_stopped': '用户停止模拟并结算', 'manual_tp1': '博主指令执行 TP1', 'runner_reduction': '博主指令减仓保留尾仓'}
+        reason_text = reasons.get(reason, f'行情触发 TP{reason.rsplit("_", 1)[-1]}' if reason.startswith('take_profit_') else reason)
+        current = connection.execute('SELECT stop_sources,target_sources FROM paper_trades WHERE id=?', (row['id'],)).fetchone()
+        self._event(connection, row['id'], 'closed' if closed else 'reduced',
+                    f'{reason_text}：成交价 {price}，平仓数量 {close_size}，剩余 {max(remaining, ZERO)}',
+                    sources=[] if manual else sources if sources is not None else json.loads(current['stop_sources' if reason == 'stop_loss' else 'target_sources']),
+                    actor='user' if manual else 'signal' if sources is not None else 'system', at=now,
+                    values={'price': str(price), 'quantity': str(close_size), 'remaining': str(remaining), 'reason': reason})
         return connection.execute("SELECT * FROM paper_trades WHERE id=?", (row["id"],)).fetchone()
 
     def _snapshot(self, connection: sqlite3.Connection) -> PaperAccount:

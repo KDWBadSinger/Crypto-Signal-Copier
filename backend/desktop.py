@@ -140,7 +140,7 @@ def main() -> None:
                         break
                     time.sleep(0.2)
                 result = {"heading": title, "title": window.evaluate_js("document.title"), "market_body": body}
-                window.evaluate_js("document.querySelector('[aria-label=\"连接管理\"]').click()")
+                window.evaluate_js("document.querySelector('[aria-label=\"链接管理\"]').click()")
                 deadline = time.monotonic() + 15
                 while time.monotonic() < deadline:
                     body = window.evaluate_js("document.body.innerText")
@@ -157,7 +157,7 @@ def main() -> None:
                     time.sleep(0.1)
                 result["telegram_inbox_body"] = body
                 result["telegram_stream_connected"] = "桌面实时推送已连接" in body
-                window.evaluate_js("document.querySelector('[aria-label=\"实盘模拟\"]').click()")
+                window.evaluate_js("document.querySelector('[aria-label=\"跟单模拟\"]').click()")
                 deadline = time.monotonic() + 15
                 while time.monotonic() < deadline:
                     body = window.evaluate_js("document.body.innerText")
