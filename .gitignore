@@ -21,6 +21,11 @@ backend/.venv/
 prototype/node_modules/
 prototype/dist/
 *.log
+.pnpm-store/
+
+# Generated review/export artifacts
+/output/
+/tmp/
 
 # OS/editor
 .DS_Store
