@@ -64,6 +64,16 @@ class UtaRuntime:
         self.store.set_setting(self._key('enabled'),'false')
         return self.status()
 
+    def selected_sources(self):
+        import json
+        value = self.store.get_setting(self._key('sources'))
+        return json.loads(value) if value is not None else None
+
+    def set_sources(self, chat_ids):
+        import json
+        self.store.set_setting(self._key('sources'), json.dumps(sorted(set(chat_ids))))
+        return self.status()
+
     async def start(self):
         if not self.task or self.task.done(): self.task=asyncio.create_task(self._loop())
 
@@ -96,6 +106,9 @@ class UtaRuntime:
         return self.status()
 
     async def ingest(self,signal,leverage,default_max_percent=50,tp_percentages=None):
+        sources = self.selected_sources()
+        if sources is not None and signal.source_chat_id not in sources:
+            raise BitgetError('该频道未选为实盘跟单来源')
         self._authorize_new()
         try:
             row=await self.engine.start(signal,limits=self.limits(),requested_leverage=leverage,default_max_percent=default_max_percent,tp_percentages=tp_percentages)
@@ -143,17 +156,25 @@ class UtaRuntime:
 
     def status(self):
         return {'enabled':self.enabled,'ready':self.ready,'management_authorized':self.management_authorized,
+                'selected_sources': self.selected_sources(),
                 'desktop_only':not self.host_authorized,'limits':self.limits().model_dump(mode='json'),
                 'hard_limits':{'position_percent':'7','max_leverage':None,'max_positions':6},
                 'leverage_policy':'未配置币种采用币种杠杆页保存的最大杠杆比例向下取整；0% 暂停未配置币种新开仓；单币种配置优先',
                 'margin_mode':'crossed','last_check':self.last_check,'error':self.error,
                 'workflows':[{'signal_id':r['signal_id'],'symbol':r['symbol'],'state':r['state'],
+                    'side':r['payload']['signal']['side'],
+                    'created_at':r['payload'].get('entry_signal',r['payload']['signal']).get('received_at'),
+                    'entry_price':r['payload'].get('entry_price'),
+                    'entry_low':r['payload']['signal'].get('entry_low'),
+                    'take_profits':r['payload'].get('preview',{}).get('take_profits',[]),
+                    'tp_percentages':r['payload'].get('tp_percentages',[40,40,20]),
+                    'protection_states':r['payload'].get('protection_states',{}),
                     'manual_close_requested':r['payload'].get('manual_close_requested',False),
                     'detail':r['payload'].get('detail'),'remaining_qty':r['payload'].get('remaining_qty'),
                     'margin':r['payload'].get('margin'),'leverage':r['payload'].get('preview',{}).get('effective_leverage'),
                     'awaiting_protection':r['payload']['signal'].get('awaiting_protection',False),
                     'protection_deadline':r['payload'].get('protection_deadline'),
-                    'current_stop':r['payload'].get('current_stop'),
+                    'current_stop':r['payload'].get('current_stop',r['payload'].get('preview',{}).get('payload',{}).get('stopLoss')),
                     'realized_after_fees':r['payload'].get('realized_after_fees'),'updated_at':r['updated_at']} for r in self.engine.all()],
                 'detail':'停止新开仓后仍管理已有持仓；关闭应用后交易所保护单保留，重新打开先核对再跟单。'}
 

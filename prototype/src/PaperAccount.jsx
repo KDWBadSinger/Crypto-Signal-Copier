@@ -1,4 +1,5 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { Fragment, useCallback, useEffect, useRef, useState } from "react";
+import { OrderHistory } from './OrderHistory';
 import { ClosePositionDialog } from "./ClosePositionDialog";
 import { closePaperPositions } from "./api";
 import {
@@ -77,6 +78,7 @@ function SourcePicker({ sources, selectedSources, disabled, onToggle }) {
 }
 
 export function PaperAccountView() {
+  const [expandedId, setExpandedId] = useState(null);
   const [account, setAccount] = useState(null);
   const [closeTarget,setCloseTarget]=useState(null);
   const [closeBusy,setCloseBusy]=useState(false);
@@ -200,7 +202,7 @@ export function PaperAccountView() {
       <header className="paper-header">
         <div>
           <span className="paper-eyebrow">LOCAL PAPER TRADING</span>
-          <h1>实盘行情模拟账户</h1>
+          <h1>跟单模拟</h1>
           <p>读取 Bitget 真实合约标记价，本金、订单、持仓与盈亏全部保存在本程序内。</p>
         </div>
         <button className="paper-refresh" disabled={loading} onClick={() => load(true).catch(err => setError(err.message))}>
@@ -279,17 +281,18 @@ export function PaperAccountView() {
           <section className="paper-panel paper-trades">
             <div className="paper-panel-title"><div><span>本地账本</span><h2>模拟订单与持仓</h2></div><button className="position-close" disabled={closeBusy||!account.trades.some(t=>["open","pending"].includes(t.status))} onClick={()=>setCloseTarget({all:true})}>全部平仓</button><small><Clock />每 5 秒刷新实盘标记价</small></div>
             {closeTarget&&<ClosePositionDialog target={closeTarget} busy={closeBusy} onCancel={()=>setCloseTarget(null)} onConfirm={closePositions}/>}
-            {account.trades.length ? <div className="paper-table-wrap"><table><thead><tr><th>币种 / 方向</th><th>状态</th><th>成交 / 参考 / 行情</th><th>数量 / 保证金</th><th>止损 / 全部止盈</th><th>盈亏</th><th>操作</th></tr></thead>
+            {account.trades.length ? <div className="paper-table-wrap"><table><thead><tr><th>币种 / 方向 / 杠杆</th><th>状态</th><th>成交 / 参考 / 行情</th><th>数量 / 保证金</th><th>止损 / 全部止盈</th><th>盈亏</th><th>操作</th><th>详情</th></tr></thead>
               <tbody>{account.trades.map((trade) => {
                 const totalPnl = Number(trade.realized_pnl) + Number(trade.unrealized_pnl) - Number(trade.fees);
-                return <tr key={trade.id}>
-                  <td><strong>{trade.symbol}</strong><span className={`direction compact ${trade.side}`}>{trade.side === "long" ? "多" : "空"}</span><small>{new Date(trade.created_at).toLocaleString("zh-CN", { hour12: false })}</small></td>
+                return <Fragment key={trade.id}><tr>
+                  <td><strong>{trade.symbol}</strong><span className={`direction compact ${trade.side}`}>{trade.side === "long" ? "多" : "空"} <b className="order-leverage">{trade.leverage}x</b></span><small>{new Date(trade.created_at).toLocaleString("zh-CN", { hour12: false })}</small></td>
                   <td><span className={`trade-status ${trade.status}`}>{statusLabels[trade.status]}</span>{trade.close_reason ? <small>{{manual_close:'手动平仓',manual_close_all:'全部平仓',manual_close_all_cancelled_pending:'全部平仓时撤销待入场'}[trade.close_reason] || trade.close_reason}</small> : null}</td>
                   <td><strong>{trade.entry_price ? price(trade.entry_price) : `${price(trade.entry_low)} – ${price(trade.entry_high)}`}</strong><small>博主参考 {price(trade.entry_low)} · 行情 {trade.last_price ? price(trade.last_price) : "等待行情"}</small></td>
                   <td><strong>{trade.remaining_size ?? "—"}</strong><small>保证金 {money(trade.margin)}</small></td>
                   <td><strong className="loss">SL {price(trade.stop_loss)}</strong>{trade.awaiting_protection && trade.status === 'open' ? <small>等待保护回复 · 截止 {new Date(trade.protection_deadline).toLocaleTimeString()}</small> : trade.take_profits.length ? <>{trade.take_profits.map((target, index) => <small key={`${trade.id}-tp-${index}`}><b>{index === trade.next_take_profit && trade.status === 'open' ? '下一档 · ' : ''}TP{index + 1}</b> {price(target)}{trade.take_profits.length === 3 ? ` · ${(trade.tp_percentages || [40,40,20])[index]}% 初始数量` : ''}{trade.take_profits.length === 3 && (trade.tp_percentages || [40,40,20])[index] === 0 ? ' · 已禁用' : index < trade.next_take_profit ? ' · 已触发' : ''}</small>)}</> : <small>{trade.status === 'closed' ? '已结束' : '暂无止盈'}</small>}</td>
-                  <td><strong className={totalPnl >= 0 ? "profit" : "loss"}>{signedMoney(totalPnl)}</strong><small>手续费 {money(trade.fees)}</small></td><td>{trade.status==="open"&&<button className="position-close" disabled={closeBusy} onClick={()=>setCloseTarget({id:trade.id,symbol:trade.symbol})}>手动平仓</button>}</td>
-                </tr>;
+                  <td><strong className={totalPnl >= 0 ? "profit" : "loss"}>{signedMoney(totalPnl)}</strong><small>手续费 {money(trade.fees)}</small></td><td>{trade.status==="open"&&<button className="position-close" disabled={closeBusy} onClick={()=>setCloseTarget({id:trade.id,symbol:trade.symbol})}>手动平仓</button>}{trade.status==='closed'&&<span className="position-closed">已平仓</span>}</td>
+                  <td><button className="order-detail-toggle" aria-expanded={expandedId===trade.id} onClick={()=>setExpandedId(expandedId===trade.id?null:trade.id)}>{expandedId===trade.id?'收起':'展开'}</button></td>
+                </tr>{expandedId===trade.id&&<tr><td colSpan={8} className="history-cell"><OrderHistory mode="paper" id={trade.id} revision={trade.updated_at}/></td></tr>}</Fragment>;
               })}</tbody></table></div> : <div className="paper-empty"><ChartLineUp size={34} /><strong>还没有模拟订单</strong><span>加入最新信号，或开启新信号自动模拟。</span></div>}
           </section>
         </div>

@@ -10,6 +10,10 @@ Build app UI in `src/`. Keep `.openai/hosting.json`, `worker/index.js`, `scripts
 
 ## Selected product direction
 
+- v0.4.7 (2026-10-02) supersedes previous navigation: 市场行情, Telegram 消息, 信号追踪, 币种杠杆, 实盘操作, 跟单模拟, 资金管理, 链接管理. Use a wallet for live operations, a flask for paper simulation, and a document/record icon for signal tracking.
+- Keep signal tracking behavior intact; move live UTA controls and real-account equity observations to the independent 实盘操作 page. Mirror the paper page's settings, metric cards, source strategy, orders and performance layout, using actual exchange data and attributable copier returns. Preserve explicit desktop-only live activation and position limits.
+- Both live and paper order tables show per-order leverage beside the colored long/short direction, expandable per-order signal parsing and durable operation history (execution time, actual action, source name, original message and sent time), and a gray rectangular 已平仓 indicator after confirmed closure. Distinguish user actions/system triggers from blogger instructions; never fabricate missing historical evidence.
+
 - Put “市场行情” in its own sidebar module as the first navigation item, immediately before “信号追踪”; do not render it globally above every page. Show mainstream symbols and symbols with active positions/orders together with recent price trends.
 - Use the bright, audit-first desktop console selected as Product Design option 2.
 - Keep the signal lifecycle visible: authorized message receipt, parsing, risk checks, and execution review.

@@ -14,6 +14,7 @@ from .uta import UtaReadiness, number
 from .uta_risk import UtaRiskLimits
 from .uta_lifecycle import UtaLifecycle
 from .follow_policy import target_sizes, temporary_stop, PROTECTION_WAIT_SECONDS
+from .order_history import event, signal_evidence, message_evidence
 
 
 class UtaExecutor(UtaLifecycle):
@@ -33,6 +34,44 @@ class UtaExecutor(UtaLifecycle):
 
     def save(self, signal_id, symbol, state, payload):
         with self.store._connect() as conn:
+            conn.execute('BEGIN IMMEDIATE')
+            prior = conn.execute('SELECT state,payload FROM uta_workflows WHERE scope=? AND signal_id=?', (self.gateway.scope, signal_id)).fetchone()
+            old = json.loads(prior['payload']) if prior else {}
+            events = old.get('order_events', [])
+            known_fills = {f['id'] for f in old.get('fills', [])}
+            for fill in payload.get('fills', []):
+                if fill['id'] not in known_fills:
+                    evidence = fill.get('evidence', {})
+                    events.append(event('fill', f'{evidence.get("label", "交易所成交已核对")}：数量 {fill.get("quantity", "未记录")}，成交价 {fill.get("price") or "未记录"}；已实现盈亏 {fill["pnl"]}，手续费 {fill["fee"]} USDT',
+                                        sources=evidence.get('sources', []), actor=evidence.get('actor', 'system'),
+                                        at=datetime.fromtimestamp(int(fill['at'])/1000, UTC).isoformat(), values=fill))
+            keys = ('current_stop', 'remaining_qty', 'target_quantities', 'manual_close_requested', 'filled_qty')
+            changed = not prior or prior['state'] != state or any(old.get(k) != payload.get(k) for k in keys)
+            if changed:
+                context = payload.get('audit_context', {})
+                labels = {'prepared': '准备开仓', 'submitting': '提交开仓', 'awaiting_fill': '等待成交核对',
+                          'protecting': '核对止盈止损', 'protected': '持仓与保护已核对', 'managing': '执行持仓管理',
+                          'needs_reconciliation': '等待交易所核对', 'closed': '订单已结束', 'rejected': '开仓已拒绝'}
+                changes = []
+                if old.get('current_stop') != payload.get('current_stop') and payload.get('current_stop'):
+                    changes.append('止损线更新至 '+payload['current_stop'])
+                if old.get('remaining_qty') != payload.get('remaining_qty') and payload.get('remaining_qty') is not None:
+                    changes.append('已核对剩余数量 '+payload['remaining_qty'])
+                targets = payload.get('preview', {}).get('take_profits', [])
+                if old.get('target_quantities') != payload.get('target_quantities') and targets:
+                    changes.append('止盈 '+ ' / '.join(targets))
+                detail = '；'.join([labels.get(state, state), *changes, payload.get('detail', '')])
+                actor = context.get('actor', 'system' if prior else 'signal')
+                sources = context.get('sources', payload.get('protection_sources', signal_evidence(payload.get('signal', {}))))
+                events.append(event(state, detail, sources=sources, actor=actor,
+                                    values={k: payload.get(k) for k in keys}))
+            payload['order_events'] = events
+            if not prior:
+                payload['entry_signal'] = json.loads(json.dumps(payload.get('signal', {})))
+            elif 'entry_signal' in old:
+                payload['entry_signal'] = old['entry_signal']
+            if state in {'protected', 'closed', 'rejected'} and not payload.get('pending_management') and not payload.get('protection_update'):
+                payload.pop('audit_context', None)
             conn.execute('INSERT INTO uta_workflows VALUES (?,?,?,?,?,?) ON CONFLICT(scope,signal_id) DO UPDATE SET state=excluded.state,payload=excluded.payload,updated_at=excluded.updated_at',
                          (self.gateway.scope,signal_id,symbol,state,json.dumps(payload),datetime.now(UTC).isoformat()))
 
@@ -211,6 +250,8 @@ class UtaExecutor(UtaLifecycle):
             # Persist the phase before any management write. Recovery must never
             # mistake an interrupted reduction for an unfinished initial entry.
             payload['pending_management']=identity
+            payload['audit_context'] = {'actor': 'signal', 'sources': [message_evidence(message)]}
+            payload.setdefault('reduction_evidence', {})[identity] = {'actor': 'signal', 'sources': [message_evidence(message)], 'label': '博主管理指令减仓成交'}
             close_qty=None; targets=[]
             if runner_target is not None:
                 targets=[f'tp{i+1}' for i,q in enumerate(payload['target_quantities']) if Decimal(q)>0]
@@ -234,6 +275,7 @@ class UtaExecutor(UtaLifecycle):
                 await self.gateway.modify_protection(signal_id,'sl',identity,qty=qty,stop=plan['new_stop'])
                 await self.gateway.verify_protection(signal_id,'sl',identity)
                 payload['current_stop']=plan['new_stop']; stop=plan['new_stop']; plan['stop_done']=True
+                payload.setdefault('protection_evidence', {})['sl'] = payload.get('audit_context', {}).get('sources', [])
                 self.save(signal_id,row['symbol'],'managing',payload)
             for leg in plan['targets']:
                 await self._cancel_if_pending(signal_id,leg,identity)
@@ -257,6 +299,7 @@ class UtaExecutor(UtaLifecycle):
                 if plan['runner_target'] is not None:
                     await self.gateway.protect(signal_id,'runner',symbol=row['symbol'],side=signal['side'],hold_mode=payload['hold_mode'],qty=remaining,target=plan['runner_target'])
                     await self.gateway.verify_protection(signal_id,'runner')
+                    payload.setdefault('protection_evidence', {})['runner'] = payload.get('audit_context', {}).get('sources', [])
                     flags.update(['runner','tp1'])
                 else: flags.add('tp1')
             payload.setdefault('management_messages',[]).append(identity)
@@ -315,6 +358,7 @@ class UtaExecutor(UtaLifecycle):
             for row in rows:
                 if row['state'] in {'closed','rejected'}: continue
                 p=row['payload']; p['manual_close_requested']=True
+                p['audit_context'] = {'actor': 'user', 'sources': []}
                 p['detail']='用户请求市价平仓，等待持仓归属及成交核对'
                 self.save(row['signal_id'],row['symbol'],'needs_reconciliation',p)
                 ids.append(row['signal_id'])
@@ -474,6 +518,7 @@ class UtaExecutor(UtaLifecycle):
             if any(q<Decimal(p['preview']['min_quantity']) or q*t<Decimal(p['preview']['min_notional']) for q,t in zip(sizes,targets) if q>0):
                 raise BitgetError('回复分档低于交易所最小订单，保留临时止损及原超时期限')
             p['protection_update']={'signal':signal.model_dump(mode='json'),'targets':[str(t) for t in targets],'sizes':[str(q) for q in sizes],'stop':str(stop)}
+            p['audit_context'] = {'actor': 'signal', 'sources': signal_evidence(signal)}
             self.save(signal.id,row['symbol'],'protecting',p)
             return await self._apply_protection_update(row)
 
@@ -484,6 +529,8 @@ class UtaExecutor(UtaLifecycle):
             await self.gateway.modify_protection(sid,'sl','blogger-protection',qty=qty,stop=update['stop'])
             await self.gateway.verify_protection(sid,'sl','blogger-protection')
             p['current_stop']=update['stop']
+            p['protection_sources'] = signal_evidence(update['signal'])
+            p['protection_evidence'] = {name: signal_evidence(update['signal']) for name in ['sl', *[f'tp{i+1}' for i in range(len(update['targets']))]]}
             for i,(target,size) in enumerate(zip(update['targets'],update['sizes'])):
                 if Decimal(size) == 0: continue
                 await self.gateway.protect(sid,f'tp{i+1}',symbol=row['symbol'],side=p['signal']['side'],hold_mode=p['hold_mode'],qty=size,target=target)

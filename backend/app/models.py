@@ -38,6 +38,7 @@ class ParsedSignal(BaseModel):
     source_name: str
     source_message_id: int | None = None
     raw_text: str
+    source_messages: list[dict] = Field(default_factory=list)
     market_entry: bool = False
     awaiting_protection: bool = False
     entry_correction: dict | None = None

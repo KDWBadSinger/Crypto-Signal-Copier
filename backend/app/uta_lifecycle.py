@@ -4,6 +4,7 @@ from decimal import Decimal
 
 from .bitget import BitgetError, BitgetOrderUncertain
 from .uta import number
+from .order_history import signal_evidence
 
 
 class UtaLifecycle:
@@ -13,6 +14,7 @@ class UtaLifecycle:
         plans={str(r['orderId']):r for r in await self.gateway.pending_plans()}
         legs=self.gateway.journal.operations(self.gateway.scope,f'{sid}:protection:')
         closed=Decimal(0); orders={str(p['entry_order_id']):Decimal(p['filled_qty'])}; states={}
+        evidence = {str(p['entry_order_id']): {'label': '开仓成交', 'actor': 'signal', 'sources': signal_evidence(p.get('entry_signal', p['signal']))}}
         for leg in legs:
             if leg['state'] not in {'verified','acknowledged'}:
                 raise BitgetOrderUncertain('存在尚未核对的保护操作')
@@ -37,6 +39,8 @@ class UtaLifecycle:
                 cid=str(child['subOrderId'])
                 if cid not in orders:
                     orders[cid]=number(child.get('cumExecQty'),'策略成交数量',positive=False); closed+=orders[cid]
+                    evidence[cid] = {'label': f'行情触发 {"止损" if name == "sl" else name.upper()} 成交', 'actor': 'system',
+                                     'sources': p.get('protection_evidence', {}).get(name, signal_evidence(p['signal']))}
             if state=='success' and not children:
                 raise BitgetOrderUncertain('已触发策略尚无成交子单，等待交易所同步')
         for op in self.gateway.journal.operations(self.gateway.scope,f'{sid}:reduce:'):
@@ -46,10 +50,14 @@ class UtaLifecycle:
             order=op['result']['data']; oid=str(order['orderId'])
             if oid not in orders:
                 orders[oid]=number(order['cumExecQty'],'减仓成交数量',positive=False); closed+=orders[oid]
+                command = op['operation_key'].split(':reduce:', 1)[1]
+                evidence[oid] = p.get('reduction_evidence', {}).get(command, {
+                    'label': '用户手动平仓成交' if command.startswith('manual-close-') else {'protection-timeout': '等待保护回复超时退出成交', 'protection-failsafe': '保护失效退出成交'}.get(command, '减仓成交'),
+                    'actor': 'user' if command.startswith('manual-close-') else 'system', 'sources': []})
         if closed+qty!=Decimal(p['filled_qty']):
             raise BitgetOrderUncertain('实时持仓与本程序成交明细不一致；可能有手动交易，暂停自动操作')
         p['remaining_qty']=str(qty); p['protection_states']=states
-        await self.collect_performance(row,orders)
+        await self.collect_performance(row,orders,evidence)
         if qty==0:
             for leg in legs:
                 oid=str(leg['result']['data']['orderId'])
@@ -88,7 +96,7 @@ class UtaLifecycle:
         p['detail']='剩余仓位、交易所保护及成交明细已核对'
         self.save(sid,symbol,'protected',p)
 
-    async def collect_performance(self,row,orders):
+    async def collect_performance(self,row,orders,evidence=None):
         fills={}
         for oid in sorted(orders):
             rows=await self.gateway.pages('/api/v3/trade/fills',{'category':'USDT-FUTURES','orderId':oid,'limit':'100'})
@@ -105,6 +113,8 @@ class UtaLifecycle:
                     if item.get('feeCoin')!='USDT': raise BitgetError('非 USDT 手续费暂无法归因')
                     fee+=number(item.get('fee'),'手续费',positive=False)
                 fills[str(fill['execId'])]={'id':str(fill['execId']),'at':str(fill['createdTime']),
+                    'quantity': str(fill['execQty']), 'price': fill.get('execPrice'),
+                    'evidence': (evidence or {}).get(oid, {}),
                     'pnl':str(number(fill.get('execPnl'),'已实现收益',positive=False)), 'fee':str(fee)}
             if quantity!=orders[oid]: raise BitgetOrderUncertain('收益成交数量未完整同步，不结算或推算收益')
         p=row['payload']; p['fills']=list(fills.values())
