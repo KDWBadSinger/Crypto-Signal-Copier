@@ -1,0 +1,45 @@
+.telegram-inbox-page { padding: 28px; color: #1e293b; max-width: 1700px; margin: auto; }
+.inbox-page-heading, .inbox-feed-header, .inbox-message header, .inbox-message footer { display: flex; justify-content: space-between; align-items: center; gap: 16px; }
+.inbox-page-heading h1 { margin: 0; font-size: 27px; }
+.inbox-page-heading p, .inbox-feed-header small { color: #64748b; font-size: 13px; }
+.telegram-inbox-page button { cursor: pointer; background: white; border: 1px solid #dbe2eb; border-radius: 7px; padding: 9px 12px; font: inherit; font-size: 12px; color: #334155; }
+.telegram-inbox-page button:disabled { opacity: .5; cursor: default; }
+.inbox-health { display: flex; flex-wrap: wrap; gap: 24px; font-size: 12px; padding: 16px 0; color: #64748b; }
+.inbox-health i { display: inline-block; width: 7px; height: 7px; border-radius: 50%; background: #f59e0b; margin-right: 7px; }
+.inbox-health .healthy i { background: #16a34a; }
+.inbox-explainer { display: flex; gap: 10px; padding: 14px 18px; background: #eff6ff; color: #1e40af; font-size: 12px; line-height: 1.8; border-radius: 8px; margin-bottom: 20px; }
+.inbox-explainer svg { flex-shrink: 0; margin-top: 4px; font-size: 20px; }
+.inbox-layout { display: grid; grid-template-columns: 250px minmax(0, 1fr); gap: 20px; align-items: start; }
+.inbox-channels { border: 1px solid #e2e8f0; border-radius: 10px; background: white; padding: 14px; position: sticky; top: 20px; max-height: 80vh; overflow: auto; }
+.inbox-channels h2, .inbox-feed h2 { font-size: 16px; margin: 0 0 12px; }
+.inbox-channels button { width: 100%; text-align: left; margin-bottom: 8px; padding: 12px; overflow-wrap: anywhere; }
+.inbox-channels svg { margin-right: 7px; color: #2563eb; }
+.inbox-channels small { display: block; color: #64748b; margin-top: 6px; font-size: 10px; }
+.inbox-channels p { font-size: 12px; color: #64748b; line-height: 1.8; }
+.telegram-inbox-page .selected { border-color: #93c5fd; color: #1d4ed8; background: #eff6ff; }
+.inbox-feed-header { margin-bottom: 12px; }
+.inbox-feed-header h2 { margin-bottom: 5px; }
+.inbox-feed-header button { display: flex; align-items: center; gap: 7px; }
+.inbox-filters { display: flex; gap: 8px; margin-bottom: 16px; }
+.inbox-message { padding: 20px; border: 1px solid #e2e8f0; border-radius: 10px; margin-bottom: 14px; background: white; }
+.inbox-message.is-signal { border-left: 3px solid #3b82f6; }
+.inbox-message header strong { font-size: 13px; }
+.inbox-message header span { color: #94a3b8; font-size: 11px; }
+.inbox-badges { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 12px; }
+.inbox-badges b { font-size: 10px; font-weight: 500; color: #64748b; background: #f1f5f9; border-radius: 4px; padding: 4px 7px; }
+.inbox-badges .signal-badge { background: #dbeafe; color: #1d4ed8; }
+.inbox-message pre { font-family: inherit; font-size: 14px; white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.8; margin: 16px 0; }
+.inbox-reason { font-size: 12px; color: #64748b; line-height: 1.7; }
+.inbox-parsed { display: flex; flex-wrap: wrap; gap: 16px 28px; border: 1px solid #dbeafe; background: #f8fbff; padding: 14px; border-radius: 8px; margin: 12px 0; }
+.inbox-parsed small { display: block; font-size: 10px; color: #64748b; margin-bottom: 5px; }
+.inbox-parsed strong { font-size: 12px; }
+.inbox-message footer { font-size: 12px; color: #475569; margin-top: 14px; }
+.inbox-message details { font-size: 11px; color: #64748b; border-top: 1px solid #f1f5f9; padding-top: 12px; margin-top: 12px; overflow-wrap: anywhere; }
+.inbox-message summary { cursor: pointer; }
+.inbox-empty { padding: 48px; text-align: center; background: #f8fafc; border-radius: 10px; color: #64748b; font-size: 13px; line-height: 1.8; }
+.inbox-alert, .inbox-feedback { background: #fffbeb; color: #92400e; border-radius: 8px; font-size: 12px; padding: 12px; }
+.inbox-attachment { padding: 12px; border-radius: 6px; background: #f8fafc; margin: 12px 0; font-size: 12px; }
+.inbox-attachment button { margin-left: 12px; }
+.inbox-attachment small { display: block; margin-top: 6px; color: #64748b; }
+.inbox-attachment img { display: block; max-width: 100%; max-height: 460px; border-radius: 6px; margin-top: 12px; }
+@media (max-width: 1100px) { .inbox-layout { grid-template-columns: 200px minmax(0, 1fr); } .telegram-inbox-page { padding: 18px; } .inbox-message header { align-items: start; flex-direction: column; gap: 6px; } }

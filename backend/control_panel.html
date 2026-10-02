@@ -1,0 +1,18 @@
+<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>Copier 授权管理</title>
+<style>body{font:15px system-ui;max-width:1000px;margin:40px auto;color:#233752;background:#f5f8fc}section{background:white;padding:24px;border:1px solid #dce4ef;border-radius:12px;margin:20px 0}input,button{padding:10px;margin:6px;border:1px solid #ccd8e8;border-radius:6px}button{cursor:pointer;color:#235dc5;background:#eef4ff}td,th{padding:12px;text-align:left;border-bottom:1px solid #e5eaf2}#notice{white-space:pre-wrap}small{color:#67798e}</style>
+<h1>账号与设备授权管理</h1><small>本地验收服务 · 不接收交易所 API、Telegram 会话或支付信息</small>
+<section><h2>登录 / 试用注册</h2><input id="username" placeholder="账号" autocomplete="username"><input id="password" type="password" placeholder="至少 12 位密码" autocomplete="current-password"><button id="login">登录</button><button id="register">注册 7 天试用</button><button id="logout">退出</button><p id="notice" role="status"></p></section>
+<section id="admin" hidden><h2>用户授权</h2><p>输入天数会将到期日设置为从现在起的天数；0 表示立即到期。</p><button id="refresh">刷新用户</button><table><thead><tr><th>账号</th><th>到期时间</th><th>状态</th><th>设备上限</th><th>授权天数</th><th>操作</th></tr></thead><tbody id="users"></tbody></table></section>
+<script>
+let token='';
+const $=id=>document.getElementById(id);
+const note=value=>$('notice').textContent=value;
+async function api(path,body){const r=await fetch(path,{method:body?'POST':'GET',headers:{'Content-Type':'application/json','Authorization':`Bearer ${token}`},...(body?{body:JSON.stringify(body)}:{})});const result=await r.json();if(!r.ok)throw Error(typeof result.detail==='string'?result.detail:'输入无效或操作失败');return result;}
+async function safely(work){try{await work();}catch(error){note(error.message);}}
+const credentials=()=>({username:$('username').value,password:$('password').value});
+$('register').onclick=()=>safely(async()=>{note((await api('/register',credentials())).detail);$('password').value='';});
+$('login').onclick=()=>safely(async()=>{const result=await api('/login',credentials());token=result.token;$('password').value='';$('admin').hidden=!result.admin;note(`已登录 ${result.username}`);if(result.admin)await refresh();});
+$('logout').onclick=()=>safely(async()=>{await api('/logout',{});token='';$('admin').hidden=true;note('已退出');});
+async function refresh(){const users=await api('/admin/users');$('users').replaceChildren();for(const user of users){const row=document.createElement('tr');for(const value of [user.username,new Date(user.expires*1000).toLocaleString(),user.disabled?'已禁用':'可用']){const td=document.createElement('td');td.textContent=value;row.append(td);}const limit=document.createElement('input');limit.type='number';limit.min='1';limit.max='20';limit.value=user.device_limit;const days=document.createElement('input');days.type='number';days.min='0';days.max='3660';days.value='30';for(const el of [limit,days]){const td=document.createElement('td');td.append(el);row.append(td);}const actions=document.createElement('td');for(const [title,run] of [['更新授权',()=>api(`/admin/users/${encodeURIComponent(user.username)}/grant`,{days:Number(days.value),device_limit:Number(limit.value),disabled:!!user.disabled})],[user.disabled?'启用':'禁用',()=>api(`/admin/users/${encodeURIComponent(user.username)}/grant`,{days:Math.max(0,Math.ceil((user.expires-Date.now()/1000)/86400)),device_limit:user.device_limit,disabled:!user.disabled})],['解绑设备并退出会话',()=>api(`/admin/users/${encodeURIComponent(user.username)}/reset-devices`,{})]]){const button=document.createElement('button');button.textContent=title;button.onclick=()=>safely(async()=>{await run();note('已保存');await refresh();});actions.append(button);}row.append(actions);$('users').append(row);}}
+$('refresh').onclick=()=>safely(refresh);
+</script></html>
