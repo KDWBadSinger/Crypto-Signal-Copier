@@ -12,6 +12,7 @@ from app.uta_executor import UtaExecutor
 from app.uta_risk import UtaRiskLimits
 from app.bitget import BitgetOrderUncertain, BitgetError
 from app.service import CopierService
+from app.entry_guard import EntryGuardSettings
 from test_uta_executor import setup, sample
 from test_uta import INSTRUMENT
 from test_desktop_workflow import settings,event,FakeTelegram
@@ -113,6 +114,7 @@ def test_invalid_reply_keeps_temporary_stop_and_deadline(tmp_path,monkeypatch):
 def test_nil_live_duplicate_fragment_and_replies_only_one_paper_position(tmp_path):
     async def run():
         service=CopierService(settings(tmp_path)); service.telegram.client=FakeTelegram()
+        service.paper_guard.configure(EntryGuardSettings(mode='off'))  # isolate correlation/temporary protection
         service.paper.reset(D(1000),10,D('.0006'),['Test channel'])
         service.paper.set_sizing(PaperSizingRequest(sizing_mode='fixed_usdt',fixed_usdt=10,leverage=10))
         async def quote(symbol): return D('.09085')

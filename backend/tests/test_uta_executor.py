@@ -106,7 +106,7 @@ def test_equity_resized_after_leverage_and_all_targets_confirmed(tmp_path,monkey
         engine,exchange=setup(tmp_path,monkeypatch)
         result=await engine.start(sample(),limits=UtaRiskLimits(),requested_leverage=30)
         assert result['state']=='protected'
-        assert result['payload']['margin']=='2.4'
+        assert D(result['payload']['margin'])==D('2.4')
         entry=next(p for _,path,k in exchange.calls if path.endswith('/place-order') for p in [k['payload']])
         assert D(entry['qty'])==D('.72') # fresh equity 40 * 6% * explicit 30x / 100
         assert len(exchange.plans)==4

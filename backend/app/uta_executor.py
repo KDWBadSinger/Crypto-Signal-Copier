@@ -18,8 +18,9 @@ from .order_history import event, signal_evidence, message_evidence
 
 
 class UtaExecutor(UtaLifecycle):
-    def __init__(self, gateway, store, authorize_new):
+    def __init__(self, gateway, store, authorize_new, entry_guard=None):
         self.gateway, self.store, self.authorize_new = gateway, store, authorize_new
+        self.entry_guard = entry_guard
         self.lock=asyncio.Lock()
         with store._connect() as conn:
             conn.execute('''CREATE TABLE IF NOT EXISTS uta_workflows (
@@ -126,12 +127,23 @@ class UtaExecutor(UtaLifecycle):
             margin=limits.margin(equity)
             # None means a fresh instrument maximum / 2, not the obsolete global cap.
             leverage=requested_leverage
-            preview=await UtaReadiness(self.gateway.client).preview(signal,margin=margin,leverage=leverage,default_max_percent=default_max_percent)
+            guard_settings=self.entry_guard.settings() if self.entry_guard else None
+            bounded=bool(guard_settings and guard_settings.mode=='enforce')
+            preview=await UtaReadiness(self.gateway.client,bounded_entry=bounded).preview(signal,margin=margin,leverage=leverage,default_max_percent=default_max_percent)
+            if self.entry_guard:
+                preview=await self.entry_guard.apply_preview(signal,preview,equity,settings=guard_settings)
+                margin=Decimal(preview.get('estimated_margin',margin))
+            first_decision=preview.get('entry_guard')
             # Validate each target's minimum lot before opening, not after it fills.
             step=Decimal(preview['quantity_step']); total=Decimal(preview['payload']['qty'])
-            sizes=target_sizes(total,len(signal.take_profits),step,allocation) if signal.take_profits else []
-            if any(q < Decimal(preview['min_quantity']) or q*t < Decimal(preview['min_notional']) for q,t in zip(sizes,signal.take_profits) if q>0):
-                raise BitgetError('投入金额不足以按全部止盈档位分仓，拒绝开单而不是省略档位')
+            try:
+                sizes=target_sizes(total,len(signal.take_profits),step,allocation) if signal.take_profits else []
+                if any(q < Decimal(preview['min_quantity']) or q*t < Decimal(preview['min_notional']) for q,t in zip(sizes,signal.take_profits) if q>0):
+                    raise BitgetError('投入金额不足以按全部止盈档位分仓，拒绝开单而不是省略档位')
+            except (BitgetError, ValueError) as exc:
+                if self.entry_guard:
+                    self.entry_guard.reject(signal, first_decision, str(exc))
+                raise
             # No preset TP: all targets will have independently owned plan IDs.
             for field in ('takeProfit','tpTriggerBy','tpOrderType'):
                 preview['payload'].pop(field,None)
@@ -148,9 +160,21 @@ class UtaExecutor(UtaLifecycle):
                 # Equity is re-read after leverage configuration, immediately before
                 # building the final order. Loss never increases the margin budget.
                 equity=await self._equity()
-                margin=limits.margin(equity)
+                margin=min(margin,limits.margin(equity))
                 configured_leverage=preview['effective_leverage']
-                preview=await UtaReadiness(self.gateway.client).preview(signal,margin=margin,leverage=requested_leverage,default_max_percent=default_max_percent)
+                ceiling=Decimal(preview['payload']['qty'])*Decimal(preview['reference_price'])
+                preview=await UtaReadiness(self.gateway.client,bounded_entry=bounded).preview(signal,margin=margin,leverage=configured_leverage,default_max_percent=default_max_percent)
+                if self.entry_guard:
+                    preview=await self.entry_guard.apply_preview(signal,preview,equity,notional_ceiling=ceiling,settings=guard_settings)
+                    margin=Decimal(preview.get('estimated_margin',margin))
+                    final_decision=preview.get('entry_guard')
+                    if first_decision and final_decision:
+                        final_decision['requested_notional']=first_decision['requested_notional']
+                        final_decision['requested_leverage']=first_decision['requested_leverage']
+                        final_decision['reasons']=list(dict.fromkeys(first_decision['reasons']+final_decision['reasons']))
+                        if final_decision['action']=='allow' and (Decimal(final_decision['approved_notional'])<Decimal(first_decision['requested_notional'])*Decimal('.99') or final_decision['effective_leverage']!=first_decision['requested_leverage']):
+                            final_decision['action']='resize'
+                        self.entry_guard.record(signal,final_decision)
                 if preview['effective_leverage'] != configured_leverage:
                     raise BitgetError('交易所杠杆限制在设置后发生变化，停止本次开单，不使用不一致杠杆')
                 step=Decimal(preview['quantity_step']); total=Decimal(preview['payload']['qty'])
@@ -167,11 +191,19 @@ class UtaExecutor(UtaLifecycle):
                 if signal.awaiting_protection:
                     payload['protection_deadline']=(datetime.now(UTC)+timedelta(seconds=PROTECTION_WAIT_SECONDS)).isoformat()
                     self.save(signal.id,signal.symbol,'submitting',payload)
-                await self.gateway.enter(signal.id,preview['payload'])
+                if self.entry_guard:
+                    self.entry_guard.require_fresh(preview.get('entry_guard'))
+                await self.gateway.enter(signal.id,preview['payload'],entry_decision=preview.get('entry_guard'))
                 self.save(signal.id,signal.symbol,'awaiting_fill',payload)
-            except BaseException:
+            except BaseException as exc:
                 # An exception does not prove the account has no exposure.
-                self.save(signal.id,signal.symbol,'needs_reconciliation',payload)
+                op=self.gateway.journal.get(self.gateway.scope,signal.id+':entry')
+                state='rejected' if op is None or op['state']=='rejected' else 'needs_reconciliation'
+                payload['detail']=str(exc) if isinstance(exc,BitgetError) else '请求中断，等待核对'
+                if state=='rejected' and self.entry_guard:
+                    self.entry_guard.reject(signal, preview.get('entry_guard'), payload['detail'])
+                    payload['preview']=preview
+                self.save(signal.id,signal.symbol,state,payload)
                 raise
             return await self._advance(signal.id)
 
@@ -450,6 +482,7 @@ class UtaExecutor(UtaLifecycle):
                 return next(r for r in self.all() if r['signal_id']==signal_id)
             payload['filled_qty']=str(qty); payload['entry_order_id']=order['orderId']
             payload['entry_price']=str(number(order.get('avgPrice'),'实际开仓均价'))
+            payload['margin']=str(Decimal(payload['entry_price'])*qty/Decimal(preview['effective_leverage']))
             if payload['signal'].get('awaiting_protection'):
                 await self.gateway.bind_preset_stop(signal_id,preview,qty)
                 await self.gateway.verify_protection(signal_id,'sl')
@@ -464,8 +497,25 @@ class UtaExecutor(UtaLifecycle):
                 self.save(signal_id,symbol,'protected',payload)
                 return next(r for r in self.all() if r['signal_id']==signal_id)
             step=Decimal(preview['quantity_step']); targets=preview['take_profits']
-            sizes=target_sizes(qty,len(targets),step,payload.get('tp_percentages'))
-            if any(q < Decimal(preview['min_quantity']) or q*Decimal(t)<Decimal(preview['min_notional']) for q,t in zip(sizes,targets) if q>0):
+            try:
+                sizes=target_sizes(qty,len(targets),step,payload.get('tp_percentages'))
+                invalid_sizes=any(q < Decimal(preview['min_quantity']) or q*Decimal(t)<Decimal(preview['min_notional']) for q,t in zip(sizes,targets) if q>0)
+            except ValueError:
+                if preview.get('entry_guard',{}).get('mode')!='enforce': raise
+                invalid_sizes=True
+            if invalid_sizes:
+                if preview.get('entry_guard',{}).get('mode')=='enforce':
+                    # A final partial IOC fill is owned exposure. Verify its SL,
+                    # persist exit intent, then use the existing recoverable close.
+                    await self.gateway.bind_preset_stop(signal_id,preview,qty)
+                    await self.gateway.verify_protection(signal_id,'sl')
+                    payload.update(protection_initialized=True,remaining_qty=str(qty),target_quantities=[],
+                                   manual_close_requested=True,guard_small_fill_exit=True,
+                                   detail='IOC 部分成交不足以分档保护，已记录只减仓退出意图')
+                    payload['audit_context']={'actor':'system','sources':[]}
+                    payload['reduction_evidence']={'manual-close-0':{'label':'IOC 小额部分成交退出','actor':'system','sources':[]}}
+                    self.save(signal_id,symbol,'needs_reconciliation',payload)
+                    return await self._resume_manual_close(row)
                 raise BitgetOrderUncertain('部分成交数量不足以分档保护；已有预设止损，需人工核对')
             self.save(signal_id,symbol,'protecting',payload)
             signal=ParsedSignal.model_validate(payload['signal'])

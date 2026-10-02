@@ -61,7 +61,7 @@ export function PaperPerformance({ revision }) {
     {account?.initialized && <><div className="performance-summary"><div><small>模拟 ID</small><strong>{account.simulation_id}</strong></div><div><small>跟单跨度</small><strong>{duration(account.elapsed_seconds)}</strong></div><div><small>累计在线运行</small><strong>{duration(account.active_seconds)}</strong></div><div><small>{account.lifecycle === 'stopped' ? '结算余额' : '当前权益'}</small><strong>{money(account.equity)} USDT</strong></div><div><small>累计净收益 / 收益率</small><strong>{money(Number(account.equity)-Number(account.initial_balance))} / {money(account.return_percent)}%</strong></div><div><small>已付模拟手续费</small><strong>{money(account.fees_paid)} USDT</strong></div></div>
       <p className="performance-note">开始：{new Date(account.started_at).toLocaleString('zh-CN')} · {account.stopped_at ? `结算：${new Date(account.stopped_at).toLocaleString('zh-CN')}` : '运行时持续跟单；关闭应用后暂停，重新打开只继续处理新信号，不追补离线交易'}</p>
       <EquityChart key={`${account.simulation_id}:${report.daily.length}`} points={report.daily} initial={account.initial_balance} />
-      <p className="performance-note">按 UTC 日汇总每日最后一次有效估值，今天为未完结数据。余额不含浮盈，权益包含浮盈；收益已扣模拟手续费。非全天在线时，记录不等于精确午夜结算；缺失日期留空。模拟不复现离线期间成交、资金费率、订单簿滑点或交易所强平，不能视为实盘收益承诺。</p>
+      <p className="performance-note">按 UTC 日汇总每日最后一次有效估值，今天为未完结数据。余额不含浮盈，权益包含浮盈；收益已扣模拟手续费。非全天在线时，记录不等于精确午夜结算；缺失日期留空。入场规则执行时仅按盘口估算开仓，模拟不复现真实撮合、撤单竞争、退出滑点、离线期间成交、资金费率或交易所强平，不能视为实盘收益承诺。</p>
     </>}
   </section>;
 }

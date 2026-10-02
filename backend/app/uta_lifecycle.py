@@ -84,6 +84,10 @@ class UtaLifecycle:
             await self.gateway.modify_protection(sid,'sl',revision,qty=qty,stop=p.get('current_stop',p['preview']['payload']['stopLoss']))
             await self.gateway.verify_protection(sid,'sl',revision)
         pending_tp=[n for n,s in states.items() if n!='sl' and s=='pending']
+        if p.get('guard_small_fill_exit'):
+            p['detail']='IOC 部分成交量不足以分档，已核对剩余仓位及止损，继续只减仓退出'
+            self.save(sid,symbol,'protected',p)
+            return
         if p['signal'].get('awaiting_protection'):
             if not p.get('manual_close_requested') and datetime.now(UTC)>=datetime.fromisoformat(p['protection_deadline']):
                 await self.gateway.reduce(sid,'protection-timeout',symbol=symbol,side=p['signal']['side'],hold_mode=p['hold_mode'],qty=qty)

@@ -15,6 +15,7 @@ function MessageCard({ message, onViewSignal }) {
     <header><strong>{message.source_name}</strong><span>{time(message.sent_at || message.received_at)} · #{message.message_id}</span></header>
     <div className="inbox-badges"><b className={message.status === 'parsed' ? 'signal-badge' : ''}>{statuses[message.status] || message.status}</b>
       {message.origin === 'history' && <b>历史补读 · 不跟单</b>}{message.origin === 'edit' && <b>消息已编辑 · 不重下单</b>}
+      {message.origin === 'delete' && <b>已观察到删除 · 原文留档</b>}
       {message.reply_to_message_id && <b>回复 #{message.reply_to_message_id}</b>}
       {message.duplicate_of && <b>归并至开单 #{message.duplicate_of}</b>}
       {message.display_only && <b>旧消息重新解析 · 不补单</b>}

@@ -2,6 +2,7 @@ import { Fragment, useEffect, useState } from 'react';
 import { AccountPerformance } from './AccountPerformance';
 import { LiveAccountOverview, liveMoney } from './LiveAccountOverview';
 import { OrderHistory, orderPrice, orderTime } from './OrderHistory';
+import { EntryQuality } from './EntryQuality';
 import './paper-account.css';
 import { ClosePositionDialog } from './ClosePositionDialog';
 import { utaRequest } from './api';
@@ -35,7 +36,7 @@ export function UtaExecution({ onManage }){
     {!data?.enabled&&<details className="uta-activation"><summary>启用真实资金自动交易</summary><p>确认后使用已保存 API 真实下单，重启后恢复。关闭应用期间不能接收博主管理消息；已提交的交易所保护单继续执行。仅使用可承受亏损的资金。</p><label>输入「我确认启用实盘自动跟单」<input value={confirm} autoComplete="off" onChange={e=>setConfirm(e.target.value)}/></label><button disabled={busy||data?.desktop_only||confirm!=='我确认启用实盘自动跟单'} onClick={()=>act('activate',{confirmation:confirm},'已启用，只处理之后收到的新信号。')}>确认并启用实盘</button>{data?.desktop_only&&<p>只能从 EXE 桌面窗口启用，浏览器预览禁止激活实盘。</p>}</details>}
     <div className="uta-actions"><button disabled={busy||!data?.enabled} onClick={()=>act('pause',{},'已停止新开仓；已有仓位继续管理。')}>停止新开仓</button><button disabled={busy||!data?.management_authorized||data?.desktop_only} onClick={()=>act('reconcile',{},'已核对，请查看订单详情。')}>立即核对 / 恢复</button><small>最近核对：{data?.last_check?new Date(data.last_check).toLocaleString():'尚未启用'}</small></div>
     {(error||data?.error)&&<p role="alert" className="uta-error">{error||data.error}</p>}{notice&&<p role="status">{notice}</p>}<p>{data?.detail}</p>
-    </section><LiveAccountOverview data={data} curve={curve} busy={busy} act={act} onManage={onManage}/>
+    </section><EntryQuality mode="uta"/><LiveAccountOverview data={data} curve={curve} busy={busy} act={act} onManage={onManage}/>
     <section className="paper-panel paper-trades"><div className="paper-panel-title"><div><span>真实交易 · 本程序归属的跟单订单</span><h2>实际订单与持仓</h2></div><button className="position-close" disabled={busy||data?.desktop_only||!data?.management_authorized||!data?.workflows?.some(r=>!["closed","rejected"].includes(r.state))} onClick={()=>setCloseTarget({all:true})}>全部平仓</button></div>
       {closeTarget&&<ClosePositionDialog live target={closeTarget} busy={busy} onCancel={()=>setCloseTarget(null)} onConfirm={closePositions}/>}
       {!data?.workflows?.length?<div className="paper-empty">尚无实盘执行记录，启用后收到的新信号才会进入执行。</div>:<div className="paper-table-wrap"><table><thead><tr><th>币种 / 方向 / 杠杆</th><th>状态</th><th>成交 / 参考</th><th>数量 / 开仓保证金</th><th>止损 / 全部止盈</th><th>已实现净收益</th><th>操作</th><th>详情</th></tr></thead><tbody>{data.workflows.map(r=><Fragment key={r.signal_id}><tr>

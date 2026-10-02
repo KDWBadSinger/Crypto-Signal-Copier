@@ -61,6 +61,7 @@ class TelegramSignalClient:
         if not self._handler_installed:
             self.client.add_event_handler(self._on_new_message, events.NewMessage())
             self.client.add_event_handler(self._on_edited_message, events.MessageEdited())
+            self.client.add_event_handler(self._on_deleted_message, events.MessageDeleted())
             self._handler_installed = True
         self.connected = True
         self.detail = f"已授权，监听 {len(self.settings.telegram_allowed_chat_ids)} 个频道 / 群组"
@@ -156,6 +157,17 @@ class TelegramSignalClient:
 
     async def _on_edited_message(self, event) -> None:
         self._schedule_message(event, edited=True)
+
+    async def _on_deleted_message(self, event) -> None:
+        # Telegram sometimes omits the peer. Never guess by message ID alone.
+        chat_id=getattr(event,'chat_id',None)
+        if chat_id not in self.settings.telegram_allowed_chat_ids or not self.has_message or not self.on_message:
+            return
+        for message_id in getattr(event,'deleted_ids',[]):
+            saved=self.has_message(chat_id,message_id)
+            if saved:
+                self.on_message({**saved,'origin':'delete','deleted_at':datetime.now(UTC).isoformat(),
+                                 'detail':'已观察到原消息删除；保留收到时的原文与订单，不重放交易'})
 
     @staticmethod
     def describe_message(raw, chat_id: int, source_name: str, *, origin: str = "live") -> dict:

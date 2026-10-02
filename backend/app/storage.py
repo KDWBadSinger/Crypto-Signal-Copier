@@ -257,7 +257,7 @@ class SignalStore:
                 return
             existing = connection.execute("SELECT payload FROM telegram_messages WHERE chat_id=? AND message_id=?",
                                           (payload["chat_id"], payload["message_id"])).fetchone()
-            if existing and payload.get("origin") == "live" and json.loads(existing["payload"]).get("origin") == "edit":
+            if existing and payload.get("origin") == "live" and json.loads(existing["payload"]).get("origin") in {"edit","delete"}:
                 return
             connection.execute(
                 """INSERT INTO telegram_messages VALUES (?, ?, ?, ?)

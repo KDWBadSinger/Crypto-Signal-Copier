@@ -40,6 +40,8 @@ from .service import CopierService
 from .release import VERSION, database_export
 from .uta import UtaReadiness
 from .uta_risk import UtaRiskLimits
+from .entry_guard import EntryGuardSettings
+from typing import Literal
 
 settings = load_settings()
 service = CopierService(settings)
@@ -66,6 +68,18 @@ app.add_middleware(
     allow_methods=["GET", "POST"],
     allow_headers=["Content-Type"],
 )
+
+
+@app.get('/api/entry-quality/{mode}')
+async def entry_quality(mode: Literal['paper','uta']):
+    return service.entry_quality(mode)
+
+
+@app.post('/api/entry-quality/{mode}')
+async def configure_entry_quality(mode: Literal['paper','uta'], request: EntryGuardSettings):
+    guard=service.paper_guard if mode=='paper' else service.uta_runtime.entry_guard
+    guard.configure(request)
+    return service.entry_quality(mode)
 
 
 @app.get('/api/uta/readiness')
@@ -171,7 +185,8 @@ async def uta_order_history(signal_id: str):
         raise HTTPException(status_code=404, detail='实盘订单不存在')
     payload = row['payload']
     return {'signal': payload.get('entry_signal', payload.get('signal', {})),
-            'events': payload.get('order_events', []), 'legacy': 'entry_signal' not in payload}
+            'events': payload.get('order_events', []), 'legacy': 'entry_signal' not in payload,
+            'entry_guard':payload.get('preview',{}).get('entry_guard')}
 
 
 @app.exception_handler(RequestValidationError)

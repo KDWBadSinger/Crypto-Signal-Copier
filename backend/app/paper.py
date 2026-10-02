@@ -107,6 +107,9 @@ class PaperTradingStore:
             if 'tp_percentages' not in trade_columns:
                 connection.execute("ALTER TABLE paper_trades ADD COLUMN tp_percentages TEXT NOT NULL DEFAULT '[40,40,20]'")
             for name, declaration in {'source_chat_id': 'INTEGER', 'source_message_id': 'INTEGER',
+                                      'entry_guard_mode': "TEXT NOT NULL DEFAULT 'off'",
+                                      'entry_guard_settings': "TEXT NOT NULL DEFAULT '{}'",
+                                      'entry_guard': "TEXT NOT NULL DEFAULT '{}'",
                                       'signal_snapshot': "TEXT NOT NULL DEFAULT '{}'",
                                       'order_events': "TEXT NOT NULL DEFAULT '[]'",
                                       'protection_sources': "TEXT NOT NULL DEFAULT '[]'",
@@ -245,8 +248,8 @@ class PaperTradingStore:
                     previous = None
                 points.append(point or {"day": day.isoformat(), "equity": None, "balance": None, "profit": None, "daily_profit": None})
                 day += timedelta(days=1)
-        history = {r['id']: {'signal': json.loads(r['signal_snapshot']), 'events': json.loads(r['order_events'])}
-                   for r in connection.execute('SELECT id,signal_snapshot,order_events FROM paper_trades')}
+        history = {r['id']: {'signal': json.loads(r['signal_snapshot']), 'events': json.loads(r['order_events']), 'entry_guard':json.loads(r['entry_guard']) or None}
+                   for r in connection.execute('SELECT id,signal_snapshot,order_events,entry_guard FROM paper_trades')}
         return {"account": account.model_dump(mode="json"), "daily": points, "timezone": "UTC", 'order_history': history}
 
     def report(self, simulation_id: str | None = None) -> dict:
@@ -327,7 +330,7 @@ class PaperTradingStore:
             if cursor.rowcount != 1:
                 raise PaperTradingError("请先初始化程序内模拟账户")
 
-    def enqueue(self, signal: ParsedSignal, *, leverage=None, tp_percentages=None) -> bool:
+    def enqueue(self, signal: ParsedSignal, *, leverage=None, tp_percentages=None, entry_guard_settings=None) -> bool:
         from .follow_policy import validate_tp_percentages
         allocation = validate_tp_percentages(tp_percentages if tp_percentages is not None else [40,40,20])
         if not self.is_initialized():
@@ -361,6 +364,8 @@ class PaperTradingStore:
             )
             connection.execute("UPDATE paper_trades SET market_entry=? WHERE signal_id=?", (int(signal.market_entry), signal.id))
             connection.execute('UPDATE paper_trades SET tp_percentages=? WHERE signal_id=?', (json.dumps(allocation), signal.id))
+            connection.execute('UPDATE paper_trades SET entry_guard_mode=?,entry_guard_settings=? WHERE signal_id=?',
+                ((entry_guard_settings or {}).get('mode','off'),json.dumps(entry_guard_settings or {}),signal.id))
             connection.execute('UPDATE paper_trades SET awaiting_protection=?, entry_deviation=? WHERE signal_id=?',
                                (int(signal.awaiting_protection),'0.10' if signal.entry_correction else '0.02',signal.id))
             connection.execute('UPDATE paper_trades SET source_chat_id=?, source_message_id=? WHERE signal_id=?',
@@ -392,7 +397,12 @@ class PaperTradingStore:
                     signal = json.loads(saved['payload'])
         if row is None:
             raise PaperTradingError('模拟订单不存在')
-        return {'signal': signal, 'events': json.loads(row['order_events']), 'legacy': legacy}
+        return {'signal': signal, 'events': json.loads(row['order_events']), 'legacy': legacy,
+                'entry_guard': json.loads(row['entry_guard']) or None}
+
+    def pending_guard_entries(self, symbol):
+        with self._connect() as conn:
+            return [dict(r) for r in conn.execute("SELECT * FROM paper_trades WHERE symbol=? AND status='pending' AND entry_guard_mode!='off'", (symbol,))]
 
     def management_target(self, chat_id, symbol=None, root_id=None, signal_id=None):
         with self._connect() as connection:
@@ -486,7 +496,7 @@ class PaperTradingStore:
         direction = Decimal("1") if side == SignalSide.LONG.value else Decimal("-1")
         return (exit_price - entry) * size * direction
 
-    def mark(self, symbol: str, price: Decimal) -> None:
+    def mark(self, symbol: str, price: Decimal, *, entry_decisions=None, exits_only=False) -> None:
         if not price.is_finite() or price <= 0:
             raise PaperTradingError("公开行情价格无效")
         now = datetime.now(UTC).isoformat()
@@ -504,25 +514,47 @@ class PaperTradingStore:
                     (str(price), now, row["id"]),
                 )
                 if row["status"] == PaperTradeStatus.PENDING.value:
-                    self._try_fill(connection, row, account, price, now)
+                    if exits_only:
+                        continue
+                    decision=(entry_decisions or {}).get(row['signal_id'])
+                    if row['entry_guard_mode']=='enforce' and not decision:
+                        continue
+                    self._try_fill(connection, row, account, price, now, decision)
                 else:
                     self._apply_exit_rules(connection, row, price, now)
 
-    def _try_fill(self, connection, row, account, price: Decimal, now: str) -> None:
+    def _try_fill(self, connection, row, account, price: Decimal, now: str, decision=None) -> None:
+        guarded = decision and decision['mode']=='enforce'
+        if decision:
+            connection.execute('UPDATE paper_trades SET entry_guard=? WHERE id=?', (json.dumps(decision),row['id']))
+            self._event(connection,row['id'],'entry_quality','；'.join(decision['reasons']),values=decision,at=now)
+            if guarded:
+                if decision['action']=='skip':
+                    self._reject(connection,row['id'],'入场质量：'+'；'.join(decision['reasons']),now)
+                    return
+                from .entry_guard import EntryGuard
+                try:
+                    EntryGuard.require_fresh(decision)
+                except RuntimeError as exc:
+                    self._reject(connection,row['id'],str(exc),now)
+                    return
+                price=Decimal(decision['estimated_fill'])
+                connection.execute('UPDATE paper_trades SET leverage=? WHERE id=?',(decision['effective_leverage'],row['id']))
+                row=connection.execute('SELECT * FROM paper_trades WHERE id=?',(row['id'],)).fetchone()
         low, high = Decimal(row["entry_low"]), Decimal(row["entry_high"])
         if row['market_entry']:
             if (datetime.fromisoformat(now)-datetime.fromisoformat(row['created_at'])).total_seconds() > 120:
                 self._reject(connection, row['id'], '市价单等待行情超过 120 秒，不追补过期信号', now)
                 return
             reference = (low + high) / 2
-            if abs(price-reference)/reference > Decimal(row['entry_deviation']):
+            if not guarded and abs(price-reference)/reference > Decimal(row['entry_deviation']):
                 self._reject(connection, row['id'], '市价偏离校验参考价超过允许范围', now)
                 return
             targets = [Decimal(x) for x in json.loads(row['take_profits'])]
             if not row['awaiting_protection'] and ((row['side'] == 'long' and (price <= Decimal(row['stop_loss']) or price >= min(targets))) or (row['side'] == 'short' and (price >= Decimal(row['stop_loss']) or price <= max(targets)))):
                 self._reject(connection, row['id'], '最新价格已越过止盈或止损，不追单', now)
                 return
-        elif not low <= price <= high:
+        elif not low <= price <= high and not guarded:
             return
         snapshot = self._snapshot(connection)
         risk_fraction = Decimal(row["risk_percent"]) / Decimal("100")
@@ -536,7 +568,7 @@ class PaperTradingStore:
         if row['awaiting_protection'] and row['sizing_mode']=='risk':
             # With a 100%-margin stop, the legacy risk budget equals initial margin.
             risk_size=risk_budget*leverage/price
-        if row['sizing_mode'] != 'risk':
+        if row['sizing_mode'] != 'risk' and not guarded:
             requested_margin = Decimal(row['sizing_value']) if row['sizing_mode'] == 'fixed_usdt' else max(snapshot.equity, ZERO)*Decimal(row['sizing_value'])/100
             risk_size = requested_margin*leverage/price
             required = requested_margin + risk_size*price*Decimal(account['fee_rate'])
@@ -545,6 +577,12 @@ class PaperTradingStore:
                 return
         capacity_size = max(snapshot.available_balance, ZERO) * leverage * Decimal("0.98") / price
         size = (min(risk_size, capacity_size) if row['sizing_mode'] == 'risk' else risk_size).quantize(MONEY, rounding=ROUND_DOWN)
+        if guarded:
+            size=Decimal(decision['quantity'])
+            required=size*price/leverage+size*price*Decimal(account['fee_rate'])
+            if required > snapshot.available_balance:
+                self._reject(connection,row['id'],'入场复核后可用余额不足，拒绝超过估算计划',now)
+                return
         if size <= ZERO:
             self._reject(connection, row["id"], "可用本金不足", now)
             return

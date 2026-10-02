@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react';
 import { getOrderHistory } from './api';
+import { EntryDecision } from './EntryQuality';
 import './order-history.css';
 
 export const orderPrice = value => value == null || value === '' ? '—' : Number(value).toLocaleString('en-US', { maximumFractionDigits: 8 });
@@ -19,6 +20,7 @@ export function OrderHistory({ mode, id, revision }) {
     {error && <p role="alert">读取详情失败：{error}</p>}
     {!data && !error && <p>正在读取订单详情…</p>}
     {data?.legacy && <p className="history-note">历史订单未保存完整操作依据；仅展示实际留存记录，不补造历史日志。</p>}
+    <EntryDecision decision={data?.entry_guard}/>
     {signal?.symbol && <section className="order-signal-snapshot"><div><h4>{data.legacy ? '当前留存的信号解析（非开仓快照）' : '开仓时的信号解析'}</h4><dl>
       <div><dt>币种 / 方向</dt><dd>{signal.symbol} · {signal.side === 'long' ? '做多' : '做空'}</dd></div>
       <div><dt>入场参考</dt><dd>{orderPrice(signal.entry_low)} — {orderPrice(signal.entry_high)}</dd></div>

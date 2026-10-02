@@ -22,7 +22,9 @@ def main() -> None:
     parser.add_argument("--smoke-test", action="store_true")
     parser.add_argument("--ui-smoke-test", action="store_true")
     args = parser.parse_args()
-    data_dir = (args.data_dir or Path(os.environ["LOCALAPPDATA"]) / "CryptoSignalCopier").resolve()
+    # This experimental release must not pick up 0.4.7 credentials, live activation,
+    # databases or the stable install's single-instance lock.
+    data_dir = (args.data_dir or Path(os.environ["LOCALAPPDATA"]) / "CryptoSignalCopier-0.4.8-preview").resolve()
     data_dir.mkdir(parents=True, exist_ok=True)
     os.environ["COPIER_DATA_DIR"] = str(data_dir)
     os.environ["APP_SEED_DEMO_DATA"] = "false"
@@ -127,7 +129,7 @@ def main() -> None:
             return
 
         import webview
-        window = webview.create_window("Crypto Signal Copier · 个人桌面版", origin + "/desktop/open?token=" + token,
+        window = webview.create_window("Crypto Signal Copier · 0.4.8 试验版", origin + "/desktop/open?token=" + token,
                                        width=1440, height=960, min_size=(1100, 720))
 
         def ui_check():

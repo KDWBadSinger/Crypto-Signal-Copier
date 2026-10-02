@@ -7,6 +7,7 @@ from app.uta import build_order_preview
 from app.parser import parse_signal
 from app.models import LeverageOverrides, PaperSizingRequest
 from app.service import CopierService
+from app.entry_guard import EntryGuardSettings
 from test_uta import INSTRUMENT
 from test_desktop_workflow import settings
 
@@ -49,6 +50,7 @@ def test_zero_and_invalid_percent():
 def test_percent_persisted_and_used_by_paper(tmp_path):
     async def run():
         service=CopierService(settings(tmp_path))
+        service.paper_guard.configure(EntryGuardSettings(mode='off'))  # legacy sizing independently of liquidity
         service.set_leverage_overrides(LeverageOverrides(default_max_percent=30))
         await service.bitget.close()
         service=CopierService(settings(tmp_path))
@@ -73,6 +75,7 @@ def test_percent_persisted_and_used_by_paper(tmp_path):
 def test_paper_actual_sizing_uses_dynamic_or_override(tmp_path,override,expected):
     async def run():
         service=CopierService(settings(tmp_path))
+        service.paper_guard.configure(EntryGuardSettings(mode='off'))  # guard is covered by test_entry_guard
         service.paper.reset(D(1000),10,D('.0006'))
         service.paper.set_sizing(PaperSizingRequest(sizing_mode='fixed_usdt',fixed_usdt=10,leverage=10))
         async def limits(symbol): return 1,100

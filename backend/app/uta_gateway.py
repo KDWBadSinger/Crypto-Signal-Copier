@@ -23,16 +23,19 @@ class UtaGateway:
             raise BitgetError('账户身份或交易产品发生变化，停止执行')
         self.authorize()
 
-    async def mutate(self, key, kind, path, payload):
+    async def mutate(self, key, kind, path, payload, *, entry_decision=None):
         async def send(value):
             async with self._write_lock:
                 await asyncio.sleep(max(0,.15-(time.monotonic()-self._last_write)))
                 self.guard()
+                if entry_decision:
+                    from .entry_guard import EntryGuard
+                    EntryGuard.require_fresh(entry_decision)
                 self._last_write=time.monotonic()
                 return await self.client._request('POST',path,payload=value)
         return await self.journal.dispatch(self.scope,key,kind,payload,send,authorize=self.guard)
 
-    async def enter(self, signal_id, payload):
+    async def enter(self, signal_id, payload, *, entry_decision=None):
         if payload.get('category') != 'USDT-FUTURES' or payload.get('marginMode') != 'crossed':
             raise BitgetError('UTA 开单仅允许 USDT 全仓合约')
         number(payload.get('qty'),'数量')
@@ -41,7 +44,7 @@ class UtaGateway:
             raise BitgetError('必须预设标记价触发的市价止损')
         key=f'{signal_id}:entry'
         payload={**payload,'clientOid':self.journal.client_id(self.scope,key)}
-        return await self.mutate(key,'entry','/api/v3/trade/place-order',payload)
+        return await self.mutate(key,'entry','/api/v3/trade/place-order',payload,entry_decision=entry_decision)
 
     async def set_leverage(self, signal_id, symbol, leverage):
         value=number(leverage,'杠杆')

@@ -112,6 +112,7 @@ export function saveTakeProfitAllocation(percentages) {
 
 export const getSignal = (id, signal) => apiRequest(`/api/signals/${encodeURIComponent(id)}`, { signal });
 export const getOrderHistory = (mode, id, signal) => apiRequest(`/api/${mode}/orders/${encodeURIComponent(id)}/history`, { signal });
+export const entryQuality = (mode, values, signal) => apiRequest(`/api/entry-quality/${mode}`, values ? { method:'POST', body:JSON.stringify(values), signal } : { signal });
 
 export function getSignalAudit(signalId, signal) {
   return apiRequest(`/api/signals/${signalId}/audit`, { signal });

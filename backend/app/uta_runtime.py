@@ -12,11 +12,13 @@ from .uta_risk import UtaRiskLimits
 
 
 class UtaRuntime:
-    def __init__(self,client,store):
+    def __init__(self,client,store,*,guard_entries=False):
         self.client,self.store=client,store
         self.journal=ExecutionJournal(store)
         self.gateway=UtaGateway(client,self.journal,self._authorize_write)
-        self.engine=UtaExecutor(self.gateway,store,self._authorize_new)
+        from .entry_guard import EntryGuard
+        self.entry_guard=EntryGuard(client,store,'uta:'+self.gateway.scope) if guard_entries else None
+        self.engine=UtaExecutor(self.gateway,store,self._authorize_new,self.entry_guard)
         self.host_authorized=False
         self.enabled=store.get_setting(self._key('enabled'))=='true'
         self.management_authorized=store.get_setting(self._key('authorized'))=='true'

@@ -1,5 +1,6 @@
 import { Fragment, useCallback, useEffect, useRef, useState } from "react";
 import { OrderHistory } from './OrderHistory';
+import { EntryQuality } from './EntryQuality';
 import { ClosePositionDialog } from "./ClosePositionDialog";
 import { closePaperPositions } from "./api";
 import {
@@ -224,7 +225,7 @@ export function PaperAccountView() {
       {account?.lifecycle === 'stopped' && <PaperPerformance revision={`${account.simulation_id}:${account.updated_at}`} />}
       {(account?.lifecycle !== 'stopped' || creating) && <section className="paper-panel paper-sizing" aria-label="模拟开仓设置">
         <h2>模拟开仓设置</h2>
-        <p>保证金是投入本金；持仓名义金额 = 保证金 × 杠杆。设置只影响保存后收到的新订单，已有挂单与持仓保持原参数。</p>
+        <p>保证金是计划投入本金；持仓名义金额 = 保证金 × 杠杆。启用下方入场规则后可能缩单或降杠杆，实际金额见订单。设置只影响新订单。</p>
         <div className="paper-sizing-fields">
           <label>定仓方式<select value={sizingMode} onChange={e => setSizingMode(e.target.value)}><option value="fixed_usdt">每单固定保证金</option><option value="position_percent">账户权益百分比保证金</option><option value="risk">按信号风险与止损距离</option></select></label>
           {sizingMode === 'fixed_usdt' && <label>每单保证金（USDT）<input type="number" min="0.01" step="0.01" value={fixedUsdt} onChange={e => setFixedUsdt(e.target.value)} /></label>}
@@ -235,6 +236,7 @@ export function PaperAccountView() {
         <p>{sizingMode === 'risk' ? '完整信号按止损距离定仓；市价先开仓时将权益 × 风险比例作为保证金。风险比例缺省为 1%。' : sizingMode === 'fixed_usdt' ? `每单保证金 ${fixedUsdt} USDT，名义持仓 = 保证金 × 该币种实际杠杆；另扣开仓手续费。` : '以成交时权益计算保证金；余额不足则拒绝开仓，不擅自缩小订单。'}</p>
         {account?.initialized && !creating && <small>当前生效：{account.sizing_mode === 'risk' ? '风险定仓' : account.sizing_mode === 'fixed_usdt' ? `${account.fixed_usdt} USDT 保证金/单` : `权益 ${account.position_percent}% 保证金/单`} · 每笔成交记录显示实际杠杆</small>}
       </section>}
+      <EntryQuality mode="paper"/>
       {!account?.initialized || creating ? (
         <section className="paper-setup">
           <div className="setup-visual"><Wallet size={42} weight="duotone" /></div>

@@ -10,6 +10,7 @@ from app.models import PaperSizingRequest, BitgetAccountSnapshot
 from app.paper import PaperTradingStore
 from app.parser import parse_signal
 from app.service import CopierService
+from app.entry_guard import EntryGuardSettings
 from app.storage import SignalStore
 from test_desktop_workflow import settings, event, FakeTelegram
 
@@ -47,6 +48,7 @@ def test_fixed_margin_insufficient_balance_rejects(tmp_path):
 def test_split_message_to_paper_fill_without_exchange_api(tmp_path,reply):
     async def run():
         service = CopierService(settings(tmp_path,bitget_api_key=None,bitget_api_secret=None,bitget_api_passphrase=None))
+        service.paper_guard.configure(EntryGuardSettings(mode='off'))  # exact legacy margin independent of capacity
         service.telegram.client = FakeTelegram()
         service.set_manual_review(True)
         service.paper.reset(D(1000),10,D('.0006'),['Test channel'],'split')

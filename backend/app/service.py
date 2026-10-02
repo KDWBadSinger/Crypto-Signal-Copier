@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import httpx
 from dataclasses import replace
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
@@ -39,6 +40,8 @@ from .market_feed import PublicMarketFeed
 from .licensing import LicenseClient
 from .account_curve import AccountCurve
 from .uta_runtime import UtaRuntime
+from .entry_guard import EntryGuard, EntryGuardSettings
+from .source_review import SourceReview
 
 
 DEMO_SIGNAL = """ETHUSDT SHORT
@@ -53,10 +56,12 @@ class CopierService:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
         self.store = SignalStore(settings.database_path)
+        self.source_review = SourceReview(self.store)
         self.account_curve = AccountCurve(self.store)
         self.license = LicenseClient(self.store)
         self.bitget = BitgetDemoClient(settings)
-        self.uta_runtime = UtaRuntime(self.bitget,self.store)
+        self.uta_runtime = UtaRuntime(self.bitget,self.store,guard_entries=True)
+        self.paper_guard = EntryGuard(self.bitget,self.store,'paper')
         self.paper = PaperTradingStore(settings.database_path)
         self._message_subscribers: set[asyncio.Queue] = set()
         self.telegram = TelegramSignalClient(settings, self.ingest_signal, self.record_telegram_message, self.store.get_message, self.manage_telegram_position, self.store.canonicalize_signal, self.parse_live_signal)
@@ -182,21 +187,18 @@ class CopierService:
             except ValueError as exc:
                 self.store.add_audit(signal.id, 'license_blocked', str(exc))
                 return
-        if inserted and self.paper.is_initialized() and self.paper.should_auto_execute(signal.source_name):
+        follow_paper=inserted and self.paper.is_initialized() and self.paper.should_auto_execute(signal.source_name)
+        if follow_paper and not self.settings.bitget_is_demo and self.uta_runtime.enabled:
+            # Independent simulations must not delay a live signal's capacity check.
+            await asyncio.gather(self._follow_paper(signal),self._follow_uta(signal))
+            return
+        if follow_paper:
             try:
                 await self.paper_execute(signal, automatic=True)
             except (PaperTradingError, BitgetError, ValueError) as exc:
                 self.store.add_audit(signal.id, "paper_execution_failed", str(exc))
         if inserted and not self.settings.bitget_is_demo:
-            try:
-                if signal.source_chat_id not in self.settings.telegram_allowed_chat_ids:
-                    raise BitgetError('仅执行已选择 Telegram 频道的实时信号')
-                override=next((item for item in self._leverage_overrides.items if item.symbol==signal.symbol),None)
-                requested=override.leverage if override else None
-                await self.uta_runtime.ingest(signal,requested,default_max_percent=self._leverage_overrides.default_max_percent,tp_percentages=self.tp_percentages())
-                self.store.add_audit(signal.id,'uta_execution','实盘开单已进入持久化交易所核对流程')
-            except (ValueError,BitgetError) as exc:
-                self.store.add_audit(signal.id,'auto_execution_blocked',str(exc))
+            await self._follow_uta(signal)
             return
         if not inserted or self.manual_review_enabled:
             return
@@ -250,6 +252,23 @@ class CopierService:
             if latest.status not in {SignalStatus.UNKNOWN, SignalStatus.SUBMITTING}:
                 self.store.update_status(signal, SignalStatus.REJECTED, detail=str(exc))
 
+    async def _follow_paper(self,signal):
+        try:
+            await self.paper_execute(signal,automatic=True)
+        except (PaperTradingError,BitgetError,ValueError) as exc:
+            self.store.add_audit(signal.id,'paper_execution_failed',str(exc))
+
+    async def _follow_uta(self,signal):
+        try:
+            if signal.source_chat_id not in self.settings.telegram_allowed_chat_ids:
+                raise BitgetError('仅执行已选择 Telegram 频道的实时信号')
+            override=next((item for item in self._leverage_overrides.items if item.symbol==signal.symbol),None)
+            await self.uta_runtime.ingest(signal,override.leverage if override else None,
+                default_max_percent=self._leverage_overrides.default_max_percent,tp_percentages=self.tp_percentages())
+            self.store.add_audit(signal.id,'uta_execution','实盘开单已进入持久化交易所核对流程')
+        except (ValueError,BitgetError) as exc:
+            self.store.add_audit(signal.id,'auto_execution_blocked',str(exc))
+
     async def paper_execute(self, signal: ParsedSignal, *, automatic=False) -> None:
         await self.license.allow_new_order()
         minimum,maximum=await self.bitget.symbol_leverage_limits(signal.symbol)
@@ -259,7 +278,7 @@ class CopierService:
         async with self._paper_lock:
             if automatic and not self.paper.snapshot().auto_execute:
                 raise PaperTradingError('模拟自动跟单已暂停，不再新开仓')
-            inserted = self.paper.enqueue(signal,leverage=effective,tp_percentages=self.tp_percentages())
+            inserted = self.paper.enqueue(signal,leverage=effective,tp_percentages=self.tp_percentages(),entry_guard_settings=self.paper_guard.settings().model_dump(mode='json'))
         if not inserted:
             raise PaperTradingError("该信号已经加入程序内模拟账户")
         self.store.add_audit(
@@ -314,7 +333,7 @@ class CopierService:
                 active_symbols = self.paper.active_symbols()
                 prices = {symbol: await self.public_price(symbol) for symbol in active_symbols}
                 for symbol, price in prices.items():
-                    self.paper.mark(symbol, price)
+                    await self._mark_paper(symbol, price)
                 self.paper.heartbeat(market_ok=True)
             except (BitgetError, OSError, PaperTradingError) as exc:
                 self.paper.heartbeat(error="公开行情暂不可用，保留上次估值；恢复连接后继续")
@@ -354,7 +373,53 @@ class CopierService:
         async with self._paper_lock:
             quote = self.market_feed.quote(symbol)
             if quote:
-                self.paper.mark(symbol, quote['mark'])
+                await self._mark_paper(symbol, quote['mark'])
+
+    async def _mark_paper(self, symbol, price):
+        # Existing exits must run even if new-entry public data cannot be read.
+        self.paper.mark(symbol,price,exits_only=True)
+        decisions={}
+        for row in self.paper.pending_guard_entries(symbol):
+            if not row['market_entry'] and not Decimal(row['entry_low'])<=price<=Decimal(row['entry_high']):
+                continue
+            signal=ParsedSignal.model_validate_json(row['signal_snapshot'])
+            account=self.paper.snapshot()
+            leverage=int(row['leverage'])
+            if row['sizing_mode']=='risk':
+                risk=account.equity*Decimal(row['risk_percent'])/100
+                distance=abs(price-signal.stop_loss)
+                notional=risk*leverage if signal.awaiting_protection else risk/distance*price if distance else Decimal(0)
+            else:
+                margin=Decimal(row['sizing_value']) if row['sizing_mode']=='fixed_usdt' else account.equity*Decimal(row['sizing_value'])/100
+                notional=margin*leverage
+            cfg=EntryGuardSettings.model_validate_json(row['entry_guard_settings'])
+            try:
+                instrument=await self.bitget.contract_config(symbol)
+                decision=await self.paper_guard.assess(signal,notional=notional,equity=account.equity,leverage=leverage,
+                    step=instrument.get('sizeMultiplier'),tick=Decimal(str(instrument.get('priceEndStep','1')))*Decimal(10)**-int(instrument.get('pricePlace',0)),
+                    min_qty=instrument.get('minTradeNum'),min_notional=instrument.get('minTradeUSDT'),fee=account.fee_rate,settings=cfg,
+                    existing_notional=sum((t.remaining_size*(t.last_price or t.entry_price) for t in account.trades if t.symbol==symbol and t.status=='open'),Decimal(0)))
+                if decision and decision['action']!='skip' and signal.take_profits:
+                    from .follow_policy import target_sizes
+                    try:
+                        sizes=target_sizes(Decimal(decision['quantity']),len(signal.take_profits),Decimal(instrument['sizeMultiplier']),json.loads(row['tp_percentages']))
+                        too_small=any(q<Decimal(instrument['minTradeNum']) or q*t<Decimal(instrument['minTradeUSDT']) for q,t in zip(sizes,signal.take_profits) if q>0)
+                    except ValueError:
+                        too_small=True
+                    if too_small:
+                        decision.update(action='skip',approved_notional='0',quantity='0',estimated_margin='0',reasons=[*decision['reasons'],'缩单后不足以执行全部止盈档位'])
+                        self.paper_guard.record(signal,decision)
+                if decision and decision['action']!='skip' and not row['market_entry']:
+                    # A pending range signal must never turn into chasing outside its range.
+                    if not signal.entry_low <= Decimal(decision['estimated_fill']) <= signal.entry_high:
+                        continue
+            except (BitgetError,ValueError,ArithmeticError,TypeError,KeyError,httpx.HTTPError,OSError):
+                decision={'mode':cfg.mode,'action':'skip','requested_notional':str(notional),'approved_notional':'0',
+                          'reasons':['合约规格不可用，无法评估可成交数量'],'data_unavailable':True,
+                          'evaluated_at':datetime.now(UTC).isoformat()}
+                self.paper_guard.record(signal,decision)
+            decisions[signal.id]=decision
+        self.paper.mark(symbol,price,entry_decisions=decisions)
 
     async def market_overview(self) -> MarketOverview:
         core_symbols = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT"]
@@ -486,7 +551,8 @@ class CopierService:
         await old_stream.stop()
         self.settings = candidate
         self.bitget = new_client
-        self.uta_runtime = UtaRuntime(self.bitget,self.store)
+        self.uta_runtime = UtaRuntime(self.bitget,self.store,guard_entries=True)
+        self.paper_guard = EntryGuard(self.bitget,self.store,'paper')
         self.uta_runtime.host_authorized=desktop_authorized
         await self.uta_runtime.start()
         self.bitget_stream = BitgetPrivateStream(
@@ -551,18 +617,48 @@ class CopierService:
                 for chat_id in sorted(self.settings.telegram_allowed_chat_ids)]
 
     def record_telegram_message(self, message: dict) -> None:
+        self.source_review.observe_message(message)
         if message.get('_preview_only') or message.get('origin')=='repair':
             self.store.update_message_preview(message)
         else:
             self.store.record_message(message)
         self.notify_telegram_subscribers()
 
+    def entry_quality(self, mode):
+        guard=self.paper_guard if mode=='paper' else self.uta_runtime.entry_guard
+        outcomes={}
+        if mode=='uta':
+            for row in self.uta_runtime.engine.all():
+                p=row['payload']; s=p.get('entry_signal',p['signal'])
+                if not p.get('entry_price') or not p.get('filled_qty'): continue
+                outcomes.setdefault(row['signal_id'],[]).append({'entry_price':p['entry_price'],
+                    'reference':str((Decimal(s['entry_low'])+Decimal(s['entry_high']))/2),'side':s['side'],
+                    'notional':str(Decimal(p['entry_price'])*Decimal(p['filled_qty'])),
+                    'net':p.get('realized_after_fees') if row['state']=='closed' else None})
+        else:
+            with self.store._connect() as conn:
+                trades=[dict(r) for r in conn.execute("SELECT * FROM paper_trades WHERE entry_price IS NOT NULL")]
+                reports=[json.loads(r['payload']) for r in conn.execute('SELECT payload FROM paper_reports')]
+            for report in reports:
+                # The active stopped simulation is also in the current table.
+                if report['account'].get('simulation_id') != self.paper.snapshot().simulation_id:
+                    trades.extend(report['account'].get('trades',[]))
+            for t in trades:
+                if not t.get('entry_price') or not t.get('size'): continue
+                outcomes.setdefault(t['signal_id'],[]).append({'entry_price':t['entry_price'],
+                    'reference':str((Decimal(t['entry_low'])+Decimal(t['entry_high']))/2),'side':t['side'],
+                    'notional':str(Decimal(t['entry_price'])*Decimal(t['size'])),
+                    'net':str(Decimal(t['realized_pnl'])-Decimal(t['fees'])) if t['status']=='closed' else None})
+        return {'settings':guard.settings().model_dump(mode='json'),'decisions':guard.recent(),
+                'sources':self.source_review.summarize(guard,outcomes),
+                'version':'0.4.8-alpha.1','scope':mode}
+
     async def reparse_cached_messages(self):
         """Local-only migration: no on_signal/on_management/network calls."""
         count=0
         async with self.telegram._dispatch_lock:
             for cached in reversed(self.store.messages(10000)):
-                if cached.get('origin')=='edit' or cached.get('status') in {'managed','management_rejected','management','received','media'}:
+                if cached.get('origin') in {'edit','delete'} or cached.get('status') in {'managed','management_rejected','management','received','media'}:
                     continue
                 # A user-triggered repair must not retire a freshly received
                 # entry while its live protection reply is still on the way.

@@ -64,7 +64,7 @@ def test_telegram_login_two_factor_and_channel_listing(tmp_path):
         assert await client.send_code() == {"state": "code_sent"}
         assert await client.sign_in("12345", None) == {"state": "password_required"}
         assert await client.sign_in(None, "dummy-password") == {"state": "authorized"}
-        assert len(client.client.handlers) == 2
+        assert len(client.client.handlers) == 3  # new, edited, peer-qualified deletion
         assert await client.dialogs() == [{"id": -100123, "title": "Test channel", "selected": True}]
     asyncio.run(scenario())
 

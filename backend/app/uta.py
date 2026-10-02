@@ -19,7 +19,7 @@ def number(value, name, *, positive=True):
     return result
 
 
-def build_order_preview(signal, instrument, *, margin, leverage, market_price, hold_mode, account_scope, default_max_percent=50):
+def build_order_preview(signal, instrument, *, margin, leverage, market_price, hold_mode, account_scope, default_max_percent=50, bounded_entry=False):
     """Build, but never submit, a V3 market order with exchange-side protection."""
     if instrument.get('symbol') != signal.symbol or instrument.get('category') != 'USDT-FUTURES' or instrument.get('status') != 'online':
         raise BitgetError('UTA 合约不匹配、不是 USDT 永续或不可交易')
@@ -32,11 +32,15 @@ def build_order_preview(signal, instrument, *, margin, leverage, market_price, h
     if effective != effective.to_integral_value() or effective < number(instrument.get('minLeverage'),'最小杠杆'):
         raise BitgetError('UTA 杠杆超出支持范围')
     deviation=Decimal('.10') if signal.entry_correction else Decimal('.02')
-    if abs(price/signal.reference_entry-1) > deviation:
+    if not bounded_entry and abs(price/signal.reference_entry-1) > deviation:
         raise BitgetError(f'当前价格偏离校验参考价超过 {deviation*100}%，不追单')
     step = number(instrument.get('quantityMultiplier'),'数量步长')
     tick = number(instrument.get('priceMultiplier'),'价格步长')
     qty = (margin*effective/price/step).to_integral_value(rounding=ROUND_DOWN)*step
+    if bounded_entry:
+        # Respect the smaller market-size cap even though the final order is IOC.
+        maximum=number(instrument.get('maxMarketOrderQty'),'最大市价数量')
+        qty=min(qty,(maximum/step).to_integral_value(rounding=ROUND_DOWN)*step)
     if qty < number(instrument.get('minOrderQty'),'最小数量') or qty*price < number(instrument.get('minOrderAmount'),'最小名义金额'):
         raise BitgetError('保证金低于 UTA 合约最小下单要求')
     if qty > number(instrument.get('maxMarketOrderQty'),'最大市价数量'):
@@ -74,8 +78,9 @@ def build_order_preview(signal, instrument, *, margin, leverage, market_price, h
 
 
 class UtaReadiness:
-    def __init__(self, client):
+    def __init__(self, client, *, bounded_entry=False):
         self.client = client
+        self.bounded_entry = bounded_entry
 
     async def check(self):
         cfg = self.client.settings
@@ -115,4 +120,4 @@ class UtaReadiness:
             raise BitgetError('无法唯一定位 UTA 合约')
         price = await self.client.market_price(signal.symbol)
         return build_order_preview(signal,instruments[0],margin=margin,leverage=leverage,market_price=price,
-                                   hold_mode=settings.get('holdMode'),account_scope=cfg.bitget_api_environment+'|'+cfg.bitget_api_key,default_max_percent=default_max_percent)
+                                   hold_mode=settings.get('holdMode'),account_scope=cfg.bitget_api_environment+'|'+cfg.bitget_api_key,default_max_percent=default_max_percent,bounded_entry=self.bounded_entry)
